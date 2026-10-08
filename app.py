@@ -1,4 +1,4 @@
-import os, time, math, json
+import os, time, math, json, threading
 from datetime import date, datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -7,6 +7,10 @@ import pandas as pd
 import streamlit as st
 
 BASE = "https://api.jquants.com/v2"
+
+# Free plan: at most 5 API requests per minute. Shared limiter across threads.
+_API_LOCK = threading.Lock()
+_LAST_REQUEST_AT = 0.0
 
 st.set_page_config(page_title="割安株AI", page_icon="📊", layout="wide")
 
@@ -50,7 +54,13 @@ def jq_get(path: str, params: dict | None = None) -> list[dict]:
     p = dict(params or {})
     rows: list[dict] = []
     for _ in range(100):
-        r = requests.get(url, params=p, headers={"x-api-key": JQ_KEY}, timeout=45)
+        global _LAST_REQUEST_AT
+        with _API_LOCK:
+            elapsed = time.monotonic() - _LAST_REQUEST_AT
+            if _LAST_REQUEST_AT and elapsed < 12.5:
+                time.sleep(12.5 - elapsed)
+            _LAST_REQUEST_AT = time.monotonic()
+            r = requests.get(url, params=p, headers={"x-api-key": JQ_KEY}, timeout=45)
         if r.status_code == 429:
             raise JQuantsError("J-Quants APIのレート制限(429)です。少し待ってから再実行してください。")
         if r.status_code in (401, 403):
@@ -103,14 +113,32 @@ def load_master() -> pd.DataFrame:
 def latest_valuation() -> pd.DataFrame:
     # /equities/valuation supports date/code filters. Try recent calendar days
     # until a trading-day snapshot is found.
+    # Free-plan data may be delayed. Use the last day confirmed by the
+    # user's API error, rather than requesting today's out-of-range data.
+    # Update JQUANTS_LAST_AVAILABLE_DATE in Streamlit Secrets if the
+    # subscription's accessible end date changes (YYYY-MM-DD).
+    cutoff_text = secret("JQUANTS_LAST_AVAILABLE_DATE", "2026-07-16")
+    try:
+        cutoff = date.fromisoformat(cutoff_text)
+    except ValueError:
+        raise JQuantsError("JQUANTS_LAST_AVAILABLE_DATE は YYYY-MM-DD 形式で設定してください。")
+    last_day = min(date.today(), cutoff)
     for days_back in range(0, 15):
-        d = date.today() - timedelta(days=days_back)
-        rows = jq_get("/equities/valuation", {"date": d.strftime("%Y%m%d")})
+        d = last_day - timedelta(days=days_back)
+        try:
+            rows = jq_get("/equities/valuation", {"date": d.strftime("%Y%m%d")})
+        except JQuantsError as exc:
+            if "subscription covers" in str(exc).lower():
+                raise JQuantsError(
+                    "指定した日付がJ-Quants契約の取得可能期間外です。"
+                    "Streamlit Secrets の JQUANTS_LAST_AVAILABLE_DATE を確認してください。"
+                ) from exc
+            raise
         if rows:
             x = pd.DataFrame(rows)
             x["Code"] = x["Code"].map(normalize_code)
             return x
-    raise JQuantsError("直近のバリュエーションデータを取得できませんでした。")
+    raise JQuantsError("契約期間内のバリュエーションデータを取得できませんでした。")
 
 
 @st.cache_data(ttl=21600, show_spinner=False)
@@ -347,7 +375,11 @@ def build_results(master, val, years, ratio_limit, financial_limit, strict_net_c
     for c in ["PER", "ROE", "MktCap"]:
         if c in v:
             v[c] = num(v[c])
-    v = v.dropna(subset=["Code", "PER", "ROE"]).copy()
+    required = ["Code", "PER", "ROE"]
+    missing = [c for c in required if c not in v.columns]
+    if missing:
+        raise JQuantsError("株価指標APIの項目が想定と異なります: " + ", ".join(missing))
+    v = v.dropna(subset=required).copy()
     v = v[(v["PER"] > 0) & (v["ROE"] > 0)]
     v["ROE_pct"] = v["ROE"] * 100
     v["Fair_PER"] = v["ROE_pct"] * 2
@@ -400,16 +432,18 @@ def build_results(master, val, years, ratio_limit, financial_limit, strict_net_c
 
 
 st.title("割安株AI")
-st.caption("ROE × 2 = 理論PER。数値スクリーニング → ROE持続性 → 営業CF → 財務安全性 → AI二次分析")
+st.caption("ROE × 2 = 理論PER。無料プラン対応（データは約12週間遅延）。数値スクリーニング → AI二次分析")
+st.info("無料プランではデータが遅延し、ROEの5年履歴とネットキャッシュの厳密判定はできません。取得可能な期間の情報を使った参考スクリーニングです。")
 
 with st.sidebar:
     st.header("設定")
     st.write("J-Quants API: " + ("接続設定済み" if JQ_KEY else "未設定"))
     years = st.slider("ROE履歴", 3, 5, 5)
     ratio_limit = st.slider("割安判定：実PER / 理論PER", 0.20, 0.80, 0.50, 0.05)
-    financial_limit = st.slider("財務分析する上位候補数", 20, 300, 100, 10)
-    strict_net_cash = st.checkbox("ネットキャッシュ > 0 を必須", value=True)
-    use_details = st.checkbox("Premiumの財務詳細APIも使用", value=False, help="ONにすると有利子負債を詳細財務から補完します。Premium契約が必要です。")
+    financial_limit = st.slider("財務分析する上位候補数", 5, 50, 10, 5, help="無料プランは毎分5回までのため、まず10社で試してください。")
+    strict_net_cash = st.checkbox("ネットキャッシュ > 0 を必須", value=False, help="無料プランでは有利子負債の詳細が確認できないため、ONにすると候補が0件になる可能性があります。")
+    use_details = False
+    st.caption("無料プラン対応：Premium専用の財務詳細APIは呼び出しません。")
     min_score = st.slider("最低スコア", 0, 100, 50)
     run = st.button("スクリーニング実行", type="primary", use_container_width=True)
 
@@ -419,7 +453,7 @@ if not JQ_KEY:
 
 if run or "result" not in st.session_state:
     try:
-        with st.spinner("銘柄一覧と最新バリュエーションを取得しています…"):
+        with st.spinner("銘柄一覧と取得可能なバリュエーションを取得しています…"):
             master = load_master()
             master = master.loc[~sector_excluded(master)].copy()
             val = load_valuation_snapshot()
@@ -434,10 +468,11 @@ if run or "result" not in st.session_state:
             st.session_state["updated"] = datetime.now().strftime("%Y-%m-%d %H:%M")
     except Exception as e:
         st.error(str(e))
+        st.caption("取得期間外の場合はJ-Quantsの契約期間をご確認ください。無料プランのデータは約12週間遅延します。")
         st.stop()
 
 r = st.session_state.get("result", pd.DataFrame())
-st.caption(f"更新: {st.session_state.get('updated','-')} / 財務分析対象: {st.session_state.get('pool_n',0)}社 / 最終候補: {len(r)}社")
+st.caption(f"実行: {st.session_state.get('updated','-')} / 基準日: {secret('JQUANTS_LAST_AVAILABLE_DATE', '2026-07-16')}以前 / 財務分析対象: {st.session_state.get('pool_n',0)}社 / 最終候補: {len(r)}社")
 if st.session_state.get("failures", 0):
     st.caption(f"取得失敗: {st.session_state['failures']}社（API制限・プラン不足等の可能性）")
 
