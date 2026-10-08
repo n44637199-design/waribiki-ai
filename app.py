@@ -844,6 +844,50 @@ st.write(f"自己資本比率: {percent(item['EquityRatio'])} / ネットキャ�
 if item['ROE_Obs'] < years:
     st.caption('指定年数分のROE履歴は取得できていません。履歴の平均値を長期平均とみなさないでください。')
 
+# Read-only diagnosis: only fetches the selected ticker, on explicit request.
+st.subheader('財務データ診断（EDINETPORTAL）')
+with st.expander('取得した年度・項目名・数値を確認する', expanded=False):
+    st.caption('選択中の銘柄だけを再取得し、返されたJSONの構造とROE計算に必要な項目を確認します。APIキーは表示しません。')
+    if st.button('この銘柄の財務データを診断', key=f'portal_diagnose_{selected}'):
+        try:
+            # Use the existing cached API call; avoid extra calls for all tickers.
+            diagnostic_rows = load_edinetportal_financials(str(selected))
+            st.write(f'取得した年度別データ: {len(diagnostic_rows)} 行')
+            if not diagnostic_rows:
+                st.warning('財務データが0行です。APIの返却形式か対象銘柄を確認してください。')
+            else:
+                field_groups = {
+                    '年度候補': ('fiscal_year', 'year', 'fy', 'period_end', 'fiscal_year_end'),
+                    '開示日候補': ('submit_date', 'submitted_at', 'filing_date', 'disclosure_date', 'filed_at'),
+                    'ROE候補': ('roe', 'return_on_equity', 'roe_percent', 'roe_pct'),
+                    '純利益候補': ('net_income_attributable_to_owners_of_parent', 'net_income', 'profit_attributable_to_owners_of_parent'),
+                    '自己資本候補': ('shareholders_equity', 'equity_attributable_to_owners_of_parent', 'equity'),
+                    '営業CF候補': ('operating_cash_flow', 'cash_flow_from_operations', 'cash_flows_from_operating_activities', 'cash_flow_operating'),
+                }
+                all_keys = sorted({str(k) for r in diagnostic_rows for k in r.keys()})
+                st.write('**APIから返された項目名（全行の和集合）**')
+                st.code(', '.join(all_keys) or '(項目なし)', language=None)
+                st.write('**現在のコードが認識できる項目**')
+                check = []
+                for group, aliases in field_groups.items():
+                    matched = [k for k in aliases if k in all_keys]
+                    check.append({'分類': group, '一致した項目': ', '.join(matched) if matched else '一致なし'})
+                st.dataframe(pd.DataFrame(check), hide_index=True, use_container_width=True)
+                st.write('**各行の主要項目（元データを変更せず表示）**')
+                preview_keys = list(dict.fromkeys(k for aliases in field_groups.values() for k in aliases if k in all_keys))
+                # Show additional actual keys to diagnose mismatches.
+                preview_keys += [k for k in all_keys if k not in preview_keys][:18]
+                preview = [{k: str(r.get(k, ''))[:160] for k in preview_keys} for r in diagnostic_rows[:30]]
+                st.dataframe(pd.DataFrame(preview), hide_index=True, use_container_width=True)
+                st.write('**1行目のJSON構造（最大12,000文字）**')
+                import json
+                st.code(json.dumps(diagnostic_rows[0], ensure_ascii=False, indent=2, default=str)[:12000], language='json')
+                st.download_button('診断用JSONを保存', json.dumps(diagnostic_rows, ensure_ascii=False, indent=2, default=str).encode('utf-8'), file_name=f'portal_diagnostic_{selected}.json', mime='application/json', key=f'portal_json_{selected}')
+                diagnosed = portal_features(diagnostic_rows, years, date.fromisoformat(st.session_state['valuation_day']))
+                st.info(f'現行ロジックの判定: 財務年度 {diagnosed["FinancialYears"]} 年 / ROE {diagnosed["ROE_Obs"]} 年。項目名が「一致なし」の場合はマッピング修正が必要です。')
+        except Exception as exc:
+            st.error(f'診断中の取得エラー: {type(exc).__name__}: {str(exc)[:350]}')
+
 st.subheader('AIによる補足分析（任意）')
 if not OPENAI_KEY:
     st.caption('OPENAI_API_KEY が未設定のため、AI分析は無効です。数値スクリーニングは利用できます。')
