@@ -141,10 +141,110 @@ def annual_rows(frame, years):
     return frame.tail(years + 1).reset_index(drop=True)
 
 
+# EDINETPORTAL is an independent third-party service, not the FSA's official API.
+# Only historical financial fields are used; valuation stays with J-Quants.
+EDINETPORTAL_BASE = 'https://edinetportal.kazuma-45a.workers.dev'
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_edinetportal_financials(code):
+    url = f'{EDINETPORTAL_BASE}/v1/companies/{code}/financials'
+    response = requests.get(url, timeout=18, headers={'Accept': 'application/json', 'User-Agent': 'waribiki-ai/1.0'})
+    response.raise_for_status()
+    data = response.json()
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for key in ('financials', 'data', 'results', 'history', 'items', 'annual'):
+            value = data.get(key)
+            if isinstance(value, list):
+                return value
+            if isinstance(value, dict):
+                for nested in ('financials', 'data', 'items', 'annual'):
+                    if isinstance(value.get(nested), list):
+                        return value[nested]
+    return []
+
+
+def field_value(row, *names):
+    # Only explicitly identified fields are read. No unit guessing or zero filling.
+    for name in names:
+        if name in row and row[name] is not None:
+            value = pd.to_numeric(row[name], errors='coerce')
+            if pd.notna(value) and math.isfinite(float(value)):
+                return float(value)
+    return math.nan
+
+
+def portal_features(rows, years, cutoff):
+    out = dict(ROE_Avg=math.nan, ROE_Std=math.nan, ROE_Obs=0,
+               ROE_Trend=math.nan, CFO_Avg_Yen=math.nan, CFO_Obs=0,
+               CFO_Positive_Years=0, CFO_Volatility=math.nan,
+               EquityRatio=math.nan, NetCash=math.nan, NetCashConfirmed=False,
+               FinancialSource='EDINETPORTAL', FinancialYears=0)
+    observations = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        # Exclude financial statements published after the J-Quants valuation date.
+        disclosed = next((row.get(k) for k in ('submit_date', 'submitted_at', 'filing_date', 'disclosure_date') if row.get(k)), None)
+        if disclosed:
+            parsed = pd.to_datetime(disclosed, errors='coerce', utc=True)
+            if pd.notna(parsed) and parsed.date() > cutoff:
+                continue
+        fiscal = next((row.get(k) for k in ('fiscal_year', 'year', 'fy', 'period_end', 'fiscal_year_end') if row.get(k) is not None), None)
+        if fiscal is None:
+            continue
+        try:
+            year = int(str(fiscal).upper().replace('FY', '')[:4])
+        except (TypeError, ValueError):
+            continue
+        if year > cutoff.year:
+            continue
+        # If filing date is absent, exclude current fiscal year to avoid look-ahead.
+        if disclosed is None and year >= cutoff.year:
+            continue
+        roe = field_value(row, 'roe', 'return_on_equity', 'roe_percent')
+        eq_ratio = field_value(row, 'equity_ratio', 'equity_ratio_percent', 'equity_to_asset_ratio')
+        # EDINETPORTAL documents percentage ratios as 0..100 (not 0..1).
+        if pd.notna(roe) and not (-200 <= roe <= 500):
+            roe = math.nan
+        if pd.notna(eq_ratio):
+            eq_ratio = eq_ratio / 100 if 0 <= eq_ratio <= 100 else math.nan
+        cfo = field_value(row, 'operating_cash_flow', 'cash_flow_from_operations', 'cash_flows_from_operating_activities')
+        observations.append((year, roe, eq_ratio, cfo))
+    observations.sort(key=lambda x: x[0])
+    dedup = {r[0]: r for r in observations}
+    recent = [dedup[y] for y in sorted(dedup)][-years:]
+    out['FinancialYears'] = len(recent)
+    roes = [r[1] for r in recent if pd.notna(r[1])]
+    if roes:
+        out['ROE_Avg'] = float(pd.Series(roes).mean())
+        out['ROE_Std'] = float(pd.Series(roes).std(ddof=0)) if len(roes) >= 2 else math.nan
+        out['ROE_Obs'] = len(roes)
+        if len(roes) >= 2:
+            out['ROE_Trend'] = roes[-1] - roes[0]
+    ratios = [r[2] for r in recent if pd.notna(r[2])]
+    if ratios:
+        out['EquityRatio'] = ratios[-1]
+    # EDINETPORTAL amounts must be verified against API metadata before using
+    # them for yields: different financial APIs may return yen or million yen.
+    # CFO history is still useful for sign/consistency, regardless of unit.
+    cfos = [r[3] for r in recent if pd.notna(r[3])]
+    if cfos:
+        out['CFO_Obs'] = len(cfos)
+        out['CFO_Positive_Years'] = sum(c > 0 for c in cfos)
+        if len(cfos) >= 2 and sum(cfos) / len(cfos) > 0:
+            out['CFO_Volatility'] = abs(cfos[-1] - cfos[-2]) / max(abs((cfos[-1] + cfos[-2]) / 2), 1)
+    return out
+
+
 def financial_features(frame, years):
     result = dict(ROE_Avg=math.nan, ROE_Std=math.nan, ROE_Obs=0,
-                  ROE_Trend=math.nan, CFO_Avg_Yen=math.nan, CFO_Obs=0, CFO_Positive_Years=0, CFO_Volatility=math.nan,
-                  EquityRatio=math.nan, NetCash=math.nan, NetCashConfirmed=False)
+                  ROE_Trend=math.nan, CFO_Avg_Yen=math.nan, CFO_Obs=0,
+                  CFO_Positive_Years=0, CFO_Volatility=math.nan,
+                  EquityRatio=math.nan, NetCash=math.nan, NetCashConfirmed=False,
+                  FinancialSource='J-Quants', FinancialYears=0)
     annual = annual_rows(frame, years)
     if annual.empty:
         return result
@@ -153,6 +253,7 @@ def financial_features(frame, years):
     assets = numeric_column(annual, 'TA', 'TotalAssets')
     ratio = numeric_column(annual, 'EqAR', 'EquityToAssetRatio')
     cfo = numeric_column(annual, 'CFO', 'CashFlowsFromOperatingActivities', 'OperatingCashFlow')
+    result['FinancialYears'] = len(annual)
     roe_values = []
     for index in range(1, len(annual)):
         p, e0, e1 = profit.iloc[index], equity.iloc[index - 1], equity.iloc[index]
@@ -176,7 +277,6 @@ def financial_features(frame, years):
         result['CFO_Positive_Years'] = int((valid_cfo > 0).sum())
         if len(valid_cfo) == 2 and valid_cfo.mean() > 0:
             result['CFO_Volatility'] = float(abs(valid_cfo.iloc[-1] - valid_cfo.iloc[0]) / valid_cfo.mean())
-    # Prefer the issuer's reported equity-to-assets ratio over Eq / TA.
     valid_ratio = ratio.dropna()
     if len(valid_ratio) and 0 <= valid_ratio.iloc[-1] <= 1:
         result['EquityRatio'] = float(valid_ratio.iloc[-1])
@@ -184,9 +284,21 @@ def financial_features(frame, years):
         calculated = float(equity.iloc[-1] / assets.iloc[-1])
         if 0 <= calculated <= 1:
             result['EquityRatio'] = calculated
-    # Free-plan financial summaries do not reliably expose total interest-bearing debt.
-    # Therefore net cash remains unconfirmed instead of inventing a value.
     return result
+
+
+def merge_history(jq, portal):
+    if portal['ROE_Obs'] >= 2 and portal['ROE_Obs'] > jq['ROE_Obs']:
+        # Use a coherent history from one source, never average incompatible series.
+        merged = dict(portal)
+        # CFO yields must use J-Quants yen values and J-Quants market cap.
+        merged['CFO_Avg_Yen'] = jq['CFO_Avg_Yen']
+        if jq['CFO_Obs'] >= 2:
+            merged['CFO_Obs'] = jq['CFO_Obs']
+            merged['CFO_Positive_Years'] = jq['CFO_Positive_Years']
+            merged['CFO_Volatility'] = jq['CFO_Volatility']
+        return merged
+    return jq
 
 
 def excluded(frame):
@@ -256,7 +368,7 @@ def score_row(row, features, ratio_limit):
     return output
 
 
-def build_results(master, valuation, years, ratio_limit, limit):
+def build_results(master, valuation, years, ratio_limit, limit, use_portal, valuation_day):
     v = valuation.copy()
     for field in ('PER', 'ROE', 'MktCap'):
         if field in v:
@@ -283,6 +395,13 @@ def build_results(master, valuation, years, ratio_limit, limit):
             progress.progress(done / len(pool), text=f'財務データ {done}/{len(pool)}')
             try:
                 features = financial_features(job.result(), years)
+                if use_portal:
+                    try:
+                        portal_rows = load_edinetportal_financials(str(item['Code']))
+                        portal = portal_features(portal_rows, years, date.fromisoformat(valuation_day))
+                        features = merge_history(features, portal)
+                    except (requests.RequestException, ValueError, TypeError):
+                        pass  # Third-party outage: fall back to J-Quants.
                 row = score_row(item.to_dict(), features, ratio_limit)
                 if row:
                     code = row['Code']
@@ -327,8 +446,8 @@ def reason(row):
 
 
 st.title('割安株AI')
-st.caption('J-Quants V2 無料プラン対応｜min(ROE, 30%) × 2 = 参考理論PER')
-st.warning('独自の参考指標であり適正株価ではありません。ROEは評価上30%で上限を設け、履歴不足と営業CFの変動を減点します。無料プランのデータ遅延・履歴不足に注意。ネットキャッシュは未判定です。')
+st.caption('J-Quants V2 ＋ EDINETPORTAL長期財務履歴｜min(ROE, 30%) × 2 = 参考理論PER')
+st.warning('参考スクリーニングであり適正株価ではありません。ROE評価上限30%。財務履歴はEDINETPORTAL（外部・非公式API）で補完し、取得失敗時はJ-Quantsに戻します。株価指標はJ-Quantsの基準日、財務履歴は基準日以前のものを使用。ネットキャッシュは未判定です。')
 with st.sidebar:
     st.header('設定')
     st.write('J-Quants API: ' + ('設定済み' if API_KEY else '未設定'))
@@ -337,6 +456,7 @@ with st.sidebar:
     limit = st.slider('財務分析する上位候補数', 5, 50, 10, 5)
     strict_net_cash = st.checkbox('ネットキャッシュ > 0 を必須', value=False)
     min_score = st.slider('最低スコア', 0, 100, 50)
+    use_portal = st.checkbox('EDINETPORTALの長期財務履歴を補完（無料・外部サービス）', value=True)
     run = st.button('スクリーニング実行', type='primary', use_container_width=True)
 
 if not API_KEY:
@@ -346,7 +466,7 @@ if strict_net_cash:
     st.error('無料プランでは有利子負債を確実に取得できないため、ネットキャッシュ必須条件は実行できません。チェックを外してください。')
     st.stop()
 
-settings = (years, ratio_limit, limit, min_score)
+settings = (years, ratio_limit, limit, min_score, use_portal)
 if run or 'result' not in st.session_state or st.session_state.get('settings') != settings:
     try:
         with st.spinner('銘柄一覧・株価指標を取得中…'):
@@ -354,7 +474,7 @@ if run or 'result' not in st.session_state or st.session_state.get('settings') !
             master = master.loc[~excluded(master)].copy()
             valuation, valuation_day = load_valuation()
         with st.spinner('割安候補を確認中…'):
-            result, analyzed, failures = build_results(master, valuation, years, ratio_limit, limit)
+            result, analyzed, failures = build_results(master, valuation, years, ratio_limit, limit, use_portal, valuation_day)
             if not result.empty:
                 result = result[result['TotalScore'] >= min_score].copy()
         st.session_state.update(result=result, analyzed=analyzed, failures=failures,
@@ -385,7 +505,7 @@ table = pd.DataFrame({
     '割安比率': result['PER_Fair_Ratio'].map(percent),
     '営業CF利回り': result['CFO_to_MktCap'].map(percent),
     '自己資本比率': result['EquityRatio'].map(percent),
-    'ROE観測年数': result['ROE_Obs'],
+    'ROE観測年数': result['ROE_Obs'], '財務履歴出典': result['FinancialSource'],
     'ネットキャッシュ': '未判定', '総合スコア': result['TotalScore'].round(1),
 })
 st.dataframe(table, use_container_width=True, hide_index=True)
@@ -401,7 +521,7 @@ c2.metric('ROE', f"{item['ROE_pct']:.1f}%")
 c3.metric('理論PER', f"{item['Fair_PER']:.1f}倍")
 c4.metric('割安比率', percent(item['PER_Fair_Ratio']))
 st.write(f"**{item['CompanyName']}**：{reason(item)}")
-st.write(f"ROE履歴平均: {yen_percent(item['ROE_Avg'])}（観測 {int(item['ROE_Obs'])} 年、最大 {years} 年）")
+st.write(f"ROE履歴平均: {yen_percent(item['ROE_Avg'])}（観測 {int(item['ROE_Obs'])} 年、最大 {years} 年／出典: {item['FinancialSource']}）")
 st.write(f"営業CF利回り: {percent(item['CFO_to_MktCap'])}（CF観測 {int(item['CFO_Obs'])} 年、うち黒字 {int(item['CFO_Positive_Years'])} 年）")
 if item['ROE_pct'] > 30:
     st.caption('直近ROEが30%を超えるため、参考理論PERの計算では30%を上限としています。')
