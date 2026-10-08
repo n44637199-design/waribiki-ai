@@ -2,6 +2,9 @@ import os
 import math
 import time
 import threading
+import io
+import zipfile
+import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -28,6 +31,7 @@ def secret(name, default=''):
 
 
 API_KEY = secret('JQUANTS_API_KEY')
+EDINET_KEY = secret('EDINET_API_KEY')
 OPENAI_KEY = secret('OPENAI_API_KEY')
 OPENAI_MODEL = secret('OPENAI_MODEL', 'gpt-5')
 
@@ -239,6 +243,162 @@ def portal_features(rows, years, cutoff):
     return out
 
 
+# EDINET official API v2: locate annual reports near J-Quants annual disclosure dates.
+# Never use unaudited / unmatched documents as financial evidence.
+EDINET_BASE = 'https://api.edinet-fsa.go.jp/api/v2'
+
+
+@st.cache_data(ttl=86400 * 7, show_spinner=False)
+def edinet_daily_list(day):
+    if not EDINET_KEY:
+        return []
+    response = requests.get(f'{EDINET_BASE}/documents.json',
+                            params={'date': day, 'type': 2, 'Subscription-Key': EDINET_KEY},
+                            timeout=22)
+    response.raise_for_status()
+    data = response.json()
+    return data.get('results', []) if isinstance(data, dict) else []
+
+
+def edinet_reports(code, jq_frame, years, cutoff):
+    # Query only near known FY disclosure dates; a full historical crawl is impractical.
+    annual = annual_rows(jq_frame, years + 1)
+    if annual.empty or '_disclosed' not in annual:
+        return [], 'J-Quantsに年度開示日がありません'
+    dates = set()
+    for dt in annual['_disclosed'].dropna():
+        for delta in (0, 1, -1):
+            d = (dt + timedelta(days=delta)).date()
+            if d <= cutoff:
+                dates.add(d.isoformat())
+    if not dates:
+        return [], '対象日以前の開示日がありません'
+    found = {}
+    errors = []
+    for day in sorted(dates, reverse=True):
+        try:
+            docs = edinet_daily_list(day)
+        except (requests.RequestException, ValueError) as exc:
+            errors.append(str(exc)[:80])
+            continue
+        for doc in docs:
+            sec = str(doc.get('secCode') or '')[:4]
+            # docTypeCode 120: annual securities report (有価証券報告書)
+            if sec != str(code)[:4] or str(doc.get('docTypeCode')) != '120':
+                continue
+            if str(doc.get('xbrlFlag')) != '1':
+                continue
+            doc_id = doc.get('docID')
+            if doc_id:
+                found[doc_id] = {'id': doc_id, 'date': day, 'name': doc.get('filerName', '')}
+    return sorted(found.values(), key=lambda r: r['date'], reverse=True)[:years], (errors[0] if errors and not found else '')
+
+
+@st.cache_data(ttl=86400 * 30, show_spinner=False)
+def edinet_xbrl_values(doc_id):
+    response = requests.get(f'{EDINET_BASE}/documents/{doc_id}',
+                            params={'type': 1, 'Subscription-Key': EDINET_KEY}, timeout=45)
+    response.raise_for_status()
+    if not response.content.startswith(b'PK'):
+        raise ValueError('EDINETがZIP形式を返しませんでした')
+    values = {}
+    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+        candidates = [name for name in archive.namelist()
+                      if name.lower().endswith('.xbrl') and 'publicdoc/' in name.lower()
+                      and not name.split('/')[-1].lower().startswith('audit')]
+        for name in candidates[:3]:
+            try:
+                root = ET.fromstring(archive.read(name))
+            except ET.ParseError:
+                continue
+            contexts = {}
+            for element in root.iter():
+                if element.tag.split('}')[-1] != 'context':
+                    continue
+                cid = element.attrib.get('id', '')
+                if not cid:
+                    continue
+                end = next((n.text for n in element.iter() if n.tag.split('}')[-1] in ('endDate', 'instant')), '')
+                contexts[cid] = end
+            for element in root.iter():
+                tag = element.tag.split('}')[-1]
+                if tag not in ('ProfitLossAttributableToOwnersOfParent', 'NetIncome',
+                               'Equity', 'NetAssets', 'CashFlowsFromOperatingActivities',
+                               'NetCashProvidedByUsedInOperatingActivities', 'Assets'):
+                    continue
+                ctx = element.attrib.get('contextRef', '')
+                # Only current-year consolidated contexts; do not mix standalone and consolidated.
+                if 'CurrentYear' not in ctx or 'NonConsolidated' in ctx:
+                    continue
+                try:
+                    val = float(element.text)
+                except (TypeError, ValueError):
+                    continue
+                if not math.isfinite(val):
+                    continue
+                key = (tag, contexts.get(ctx, ''), 'Duration' if 'Duration' in ctx else 'Instant')
+                values.setdefault(key, val)
+    return values
+
+
+def edinet_features(reports, years, cutoff):
+    records = []
+    for doc in reports:
+        if date.fromisoformat(doc['date']) > cutoff:
+            continue
+        try:
+            values = edinet_xbrl_values(doc['id'])
+        except (requests.RequestException, ValueError, zipfile.BadZipFile):
+            continue
+        by_end = {}
+        for (tag, end, period), value in values.items():
+            if not end or end > cutoff.isoformat():
+                continue
+            rec = by_end.setdefault(end, {})
+            rec.setdefault(tag, value)
+        for end, fields in by_end.items():
+            profit = fields.get('ProfitLossAttributableToOwnersOfParent', fields.get('NetIncome'))
+            equity = fields.get('Equity', fields.get('NetAssets'))
+            assets = fields.get('Assets')
+            cfo = fields.get('CashFlowsFromOperatingActivities', fields.get('NetCashProvidedByUsedInOperatingActivities'))
+            records.append((end, profit, equity, assets, cfo, doc['id']))
+    records = sorted(records, key=lambda x: x[0])
+    dedup = {r[0]: r for r in records}
+    records = [dedup[k] for k in sorted(dedup)][-(years + 1):]
+    out = dict(ROE_Avg=math.nan, ROE_Std=math.nan, ROE_Obs=0,
+               ROE_Trend=math.nan, CFO_Avg_Yen=math.nan, CFO_Obs=0,
+               CFO_Positive_Years=0, CFO_Volatility=math.nan,
+               EquityRatio=math.nan, NetCash=math.nan, NetCashConfirmed=False,
+               FinancialSource='EDINET（金融庁・XBRL）', FinancialYears=len(records),
+               EDINET_Documents=len(reports))
+    roes = []
+    for older, newer in zip(records, records[1:]):
+        if older[2] is not None and newer[2] is not None and newer[1] is not None:
+            avg = (older[2] + newer[2]) / 2
+            if avg > 0:
+                roes.append(newer[1] / avg * 100)
+    if roes:
+        roes = roes[-years:]
+        out['ROE_Obs'] = len(roes)
+        out['ROE_Avg'] = float(pd.Series(roes).mean())
+        if len(roes) > 1:
+            out['ROE_Std'] = float(pd.Series(roes).std(ddof=0))
+            out['ROE_Trend'] = roes[-1] - roes[0]
+    cfos = [r[4] for r in records[-years:] if r[4] is not None]
+    if cfos:
+        out['CFO_Obs'] = len(cfos)
+        out['CFO_Positive_Years'] = sum(v > 0 for v in cfos)
+        if len(cfos) >= 2 and sum(cfos[-2:]) > 0:
+            out['CFO_Volatility'] = abs(cfos[-1] - cfos[-2]) / max(abs(sum(cfos[-2:]) / 2), 1)
+    if records:
+        last = records[-1]
+        if last[2] is not None and last[3] is not None and last[3] > 0:
+            ratio = last[2] / last[3]
+            if 0 <= ratio <= 1:
+                out['EquityRatio'] = ratio
+    return out
+
+
 def financial_features(frame, years):
     result = dict(ROE_Avg=math.nan, ROE_Std=math.nan, ROE_Obs=0,
                   ROE_Trend=math.nan, CFO_Avg_Yen=math.nan, CFO_Obs=0,
@@ -368,7 +528,7 @@ def score_row(row, features, ratio_limit):
     return output
 
 
-def build_results(master, valuation, years, ratio_limit, limit, use_portal, valuation_day):
+def build_results(master, valuation, years, ratio_limit, limit, use_portal, use_edinet, valuation_day):
     v = valuation.copy()
     for field in ('PER', 'ROE', 'MktCap'):
         if field in v:
@@ -394,12 +554,28 @@ def build_results(master, valuation, years, ratio_limit, limit, use_portal, valu
             item = jobs[job]
             progress.progress(done / len(pool), text=f'財務データ {done}/{len(pool)}')
             try:
-                features = financial_features(job.result(), years)
+                jq_frame = job.result()
+                features = financial_features(jq_frame, years)
+                features['EDINET_Status'] = '未実行'
+                if use_edinet and EDINET_KEY:
+                    try:
+                        reports, edinet_error = edinet_reports(str(item['Code']), jq_frame, years + 1, date.fromisoformat(valuation_day))
+                        features['EDINET_Status'] = f'報告書 {len(reports)} 件' if reports else (edinet_error or '報告書なし')
+                        if reports:
+                            official = edinet_features(reports, years, date.fromisoformat(valuation_day))
+                            if official['ROE_Obs'] > features['ROE_Obs']:
+                                status = features['EDINET_Status']
+                                features = merge_history(features, official)
+                                features['EDINET_Status'] = status
+                    except (requests.RequestException, ValueError, TypeError, KeyError) as exc:
+                        features['EDINET_Status'] = '取得失敗: ' + str(exc)[:75]
                 if use_portal:
                     try:
                         portal_rows = load_edinetportal_financials(str(item['Code']))
                         portal = portal_features(portal_rows, years, date.fromisoformat(valuation_day))
+                        status = features.get('EDINET_Status', '未実行')
                         features = merge_history(features, portal)
+                        features['EDINET_Status'] = status
                     except (requests.RequestException, ValueError, TypeError):
                         pass  # Third-party outage: fall back to J-Quants.
                 row = score_row(item.to_dict(), features, ratio_limit)
@@ -446,8 +622,8 @@ def reason(row):
 
 
 st.title('割安株AI')
-st.caption('J-Quants V2 ＋ EDINETPORTAL長期財務履歴｜min(ROE, 30%) × 2 = 参考理論PER')
-st.warning('参考スクリーニングであり適正株価ではありません。ROE評価上限30%。財務履歴はEDINETPORTAL（外部・非公式API）で補完し、取得失敗時はJ-Quantsに戻します。株価指標はJ-Quantsの基準日、財務履歴は基準日以前のものを使用。ネットキャッシュは未判定です。')
+st.caption('J-Quants V2 ＋ EDINET公式XBRL ＋ EDINETPORTAL長期財務履歴｜min(ROE, 30%) × 2 = 参考理論PER')
+st.warning('公式EDINETはJ-Quantsの年度開示日付近の有価証券報告書のみ照合するため、5年分の取得を保証しません。参考スクリーニングであり適正株価ではありません。ROE評価上限30%。財務履歴はEDINETPORTAL（外部・非公式API）で補完し、取得失敗時はJ-Quantsに戻します。株価指標はJ-Quantsの基準日、財務履歴は基準日以前のものを使用。ネットキャッシュは未判定です。')
 with st.sidebar:
     st.header('設定')
     st.write('J-Quants API: ' + ('設定済み' if API_KEY else '未設定'))
@@ -456,6 +632,8 @@ with st.sidebar:
     limit = st.slider('財務分析する上位候補数', 5, 50, 10, 5)
     strict_net_cash = st.checkbox('ネットキャッシュ > 0 を必須', value=False)
     min_score = st.slider('最低スコア', 0, 100, 50)
+    st.write('EDINET API: ' + ('設定済み' if EDINET_KEY else '未設定'))
+    use_edinet = st.checkbox('EDINET公式XBRLで財務履歴を補完（開示日付近を照合）', value=bool(EDINET_KEY))
     use_portal = st.checkbox('EDINETPORTALの長期財務履歴を補完（無料・外部サービス）', value=True)
     run = st.button('スクリーニング実行', type='primary', use_container_width=True)
 
@@ -466,7 +644,7 @@ if strict_net_cash:
     st.error('無料プランでは有利子負債を確実に取得できないため、ネットキャッシュ必須条件は実行できません。チェックを外してください。')
     st.stop()
 
-settings = (years, ratio_limit, limit, min_score, use_portal)
+settings = (years, ratio_limit, limit, min_score, use_portal, use_edinet)
 if run or 'result' not in st.session_state or st.session_state.get('settings') != settings:
     try:
         with st.spinner('銘柄一覧・株価指標を取得中…'):
@@ -474,7 +652,7 @@ if run or 'result' not in st.session_state or st.session_state.get('settings') !
             master = master.loc[~excluded(master)].copy()
             valuation, valuation_day = load_valuation()
         with st.spinner('割安候補を確認中…'):
-            result, analyzed, failures = build_results(master, valuation, years, ratio_limit, limit, use_portal, valuation_day)
+            result, analyzed, failures = build_results(master, valuation, years, ratio_limit, limit, use_portal, use_edinet, valuation_day)
             if not result.empty:
                 result = result[result['TotalScore'] >= min_score].copy()
         st.session_state.update(result=result, analyzed=analyzed, failures=failures,
@@ -506,6 +684,7 @@ table = pd.DataFrame({
     '営業CF利回り': result['CFO_to_MktCap'].map(percent),
     '自己資本比率': result['EquityRatio'].map(percent),
     'ROE観測年数': result['ROE_Obs'], '財務履歴出典': result['FinancialSource'],
+    'EDINET取得状況': result.get('EDINET_Status', pd.Series('未実行', index=result.index)),
     'ネットキャッシュ': '未判定', '総合スコア': result['TotalScore'].round(1),
 })
 st.dataframe(table, use_container_width=True, hide_index=True)
@@ -522,6 +701,7 @@ c3.metric('理論PER', f"{item['Fair_PER']:.1f}倍")
 c4.metric('割安比率', percent(item['PER_Fair_Ratio']))
 st.write(f"**{item['CompanyName']}**：{reason(item)}")
 st.write(f"ROE履歴平均: {yen_percent(item['ROE_Avg'])}（観測 {int(item['ROE_Obs'])} 年、最大 {years} 年／出典: {item['FinancialSource']}）")
+st.caption('EDINET照合: ' + str(item.get('EDINET_Status', '未実行')))
 st.write(f"営業CF利回り: {percent(item['CFO_to_MktCap'])}（CF観測 {int(item['CFO_Obs'])} 年、うち黒字 {int(item['CFO_Positive_Years'])} 年）")
 if item['ROE_pct'] > 30:
     st.caption('直近ROEが30%を超えるため、参考理論PERの計算では30%を上限としています。')
