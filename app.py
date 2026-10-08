@@ -143,7 +143,7 @@ def annual_rows(frame, years):
 
 def financial_features(frame, years):
     result = dict(ROE_Avg=math.nan, ROE_Std=math.nan, ROE_Obs=0,
-                  ROE_Trend=math.nan, CFO_Avg_Yen=math.nan, CFO_Obs=0,
+                  ROE_Trend=math.nan, CFO_Avg_Yen=math.nan, CFO_Obs=0, CFO_Positive_Years=0, CFO_Volatility=math.nan,
                   EquityRatio=math.nan, NetCash=math.nan, NetCashConfirmed=False)
     annual = annual_rows(frame, years)
     if annual.empty:
@@ -173,6 +173,9 @@ def financial_features(frame, years):
     if len(valid_cfo):
         result['CFO_Avg_Yen'] = float(valid_cfo.mean())
         result['CFO_Obs'] = len(valid_cfo)
+        result['CFO_Positive_Years'] = int((valid_cfo > 0).sum())
+        if len(valid_cfo) == 2 and valid_cfo.mean() > 0:
+            result['CFO_Volatility'] = float(abs(valid_cfo.iloc[-1] - valid_cfo.iloc[0]) / valid_cfo.mean())
     # Prefer the issuer's reported equity-to-assets ratio over Eq / TA.
     valid_ratio = ratio.dropna()
     if len(valid_ratio) and 0 <= valid_ratio.iloc[-1] <= 1:
@@ -195,36 +198,58 @@ def excluded(frame):
 
 def score_row(row, features, ratio_limit):
     per, roe = row['PER'], row['ROE_pct']
-    fair = roe * 2
+    # A one-off extremely high ROE must not imply an unlimited fair PER.
+    # 30% is a conservative screening cap, not a forecast of fair valuation.
+    roe_for_valuation = min(30.0, max(0.0, roe))
+    fair = roe_for_valuation * 2
     ratio = per / fair if fair > 0 else math.inf
     if not (0 < per and 0 < roe and ratio <= ratio_limit):
         return None
-    undervaluation = 45 * max(0, min(1, 1 - ratio))
-    roe_score = 0.0
+
+    obs = features['ROE_Obs']
     historical = features['ROE_Avg']
-    if pd.notna(historical) and historical > 0 and features['ROE_Obs'] >= 2:
-        gap = min(1.0, abs(roe - historical) / historical)
+    # Sparse history lowers confidence in the apparent discount.
+    history_factor = 1.0 if obs >= 3 else (0.75 if obs == 2 else 0.45)
+    undervaluation = 40 * max(0, min(1, 1 - ratio)) * history_factor
+
+    roe_score = 0.0
+    if pd.notna(historical) and historical > 0 and obs >= 2:
+        gap = min(1.0, abs(roe - historical) / max(abs(historical), 1))
         std = features['ROE_Std']
-        stability = 1 / (1 + max(0, std)) if pd.notna(std) else 0
+        stability = 1 / (1 + max(0, std) / 15) if pd.notna(std) else 0
         trend = features['ROE_Trend']
         trend_bonus = max(0, min(1, (trend + 10) / 20)) if pd.notna(trend) else 0
-        roe_score = 20 * (0.55 * (1 - gap) + 0.30 * stability + 0.15 * trend_bonus)
+        roe_score = 25 * (0.55 * (1 - gap) + 0.30 * stability + 0.15 * trend_bonus)
+        if obs == 2:
+            roe_score *= 0.75
+
     market_cap_million_yen = row.get('MktCap', math.nan)
     cfo = features['CFO_Avg_Yen']
-    # J-Quants MktCap is in millions of JPY; financial summary CFO is in JPY.
-    # Never divide the raw CFO (JPY) by MktCap (million JPY).
+    # J-Quants valuation market capitalization: million JPY; CFO: JPY.
     cfo_yield = (cfo / (market_cap_million_yen * 1_000_000)
                  if pd.notna(cfo) and pd.notna(market_cap_million_yen) and market_cap_million_yen > 0
                  else math.nan)
-    # A nonfinite or implausible result is missing data, not a high-scoring company.
     if pd.notna(cfo_yield) and (not math.isfinite(cfo_yield) or abs(cfo_yield) > 2):
         cfo_yield = math.nan
-    cfo_score = 20 * max(0, min(.20, cfo_yield)) / .20 if pd.notna(cfo_yield) else 0
+    # Two positive years are needed for full CFO credit; volatile CFO is discounted.
+    cfo_score = 0.0
+    if pd.notna(cfo_yield) and cfo_yield > 0:
+        cfo_score = 20 * min(.20, cfo_yield) / .20
+        if features['CFO_Obs'] < 2:
+            cfo_score *= .25
+        elif features['CFO_Positive_Years'] < 2:
+            cfo_score *= .25
+        else:
+            volatility = features['CFO_Volatility']
+            if pd.notna(volatility):
+                cfo_score *= max(.25, 1 - min(1.0, volatility) * .75)
+
     eqr = features['EquityRatio']
     eq_score = 15 * max(0, min(.50, eqr)) / .50 if pd.notna(eqr) else 0
     output = dict(row)
     output.update(features)
-    output.update(Fair_PER=fair, PER_Fair_Ratio=ratio, CFO_to_MktCap=cfo_yield,
+    output.update(Fair_PER=fair, ROE_For_Valuation=roe_for_valuation,
+                  PER_Fair_Ratio=ratio, CFO_to_MktCap=cfo_yield,
                   UndervaluationScore=undervaluation, ROESustainabilityScore=roe_score,
                   CFOYieldScore=cfo_score, EquityRatioScore=eq_score,
                   TotalScore=undervaluation + roe_score + cfo_score + eq_score)
@@ -242,7 +267,7 @@ def build_results(master, valuation, years, ratio_limit, limit):
     v = v.dropna(subset=['Code', 'PER', 'ROE'])
     v = v[(v['PER'] > 0) & (v['ROE'] > 0)].copy()
     v['ROE_pct'] = v['ROE'] * 100
-    v['Fair_PER'] = v['ROE_pct'] * 2
+    v['Fair_PER'] = v['ROE_pct'].clip(upper=30) * 2
     v['PER_Fair_Ratio'] = v['PER'] / v['Fair_PER']
     v = v[v['Code'].isin(set(master['Code']))]
     pool = v[v['PER_Fair_Ratio'] <= ratio_limit].sort_values('PER_Fair_Ratio').head(limit)
@@ -287,17 +312,23 @@ def reason(row):
         notes.append('理論PERに対して割安')
     if row['ROE_Obs'] >= 2 and pd.notna(row['ROE_Avg']):
         notes.append('ROE履歴を確認済み' if row['ROE_pct'] >= row['ROE_Avg'] * .9 else '過去平均よりROE低下')
-    if pd.notna(row['CFO_to_MktCap']) and row['CFO_to_MktCap'] >= .05:
+    if row['CFO_Obs'] >= 2 and row['CFO_Positive_Years'] == 2 and pd.notna(row['CFO_to_MktCap']) and row['CFO_to_MktCap'] >= .05:
         notes.append('営業CF利回り5%以上')
     if pd.notna(row['EquityRatio']) and row['EquityRatio'] >= .5:
         notes.append('自己資本比率50%以上')
+    if row['ROE_Obs'] < 2:
+        notes.append('ROE履歴不足・参考評価')
+    if row['ROE_pct'] > 30:
+        notes.append('高ROEを30%に制限して評価')
+    if row['CFO_Obs'] < 2 or row['CFO_Positive_Years'] < 2:
+        notes.append('営業CFの継続性未確認')
     notes.append('ネットキャッシュ未判定')
     return ' / '.join(notes)
 
 
 st.title('割安株AI')
-st.caption('J-Quants V2 無料プラン対応｜ROE × 2 = 参考理論PER')
-st.warning('理論PERは独自の簡易指標で、適正株価の保証ではありません。無料プランはデータ遅延・履歴不足があり、ネットキャッシュは判定しません。')
+st.caption('J-Quants V2 無料プラン対応｜min(ROE, 30%) × 2 = 参考理論PER')
+st.warning('独自の参考指標であり適正株価ではありません。ROEは評価上30%で上限を設け、履歴不足と営業CFの変動を減点します。無料プランのデータ遅延・履歴不足に注意。ネットキャッシュは未判定です。')
 with st.sidebar:
     st.header('設定')
     st.write('J-Quants API: ' + ('設定済み' if API_KEY else '未設定'))
@@ -371,7 +402,11 @@ c3.metric('理論PER', f"{item['Fair_PER']:.1f}倍")
 c4.metric('割安比率', percent(item['PER_Fair_Ratio']))
 st.write(f"**{item['CompanyName']}**：{reason(item)}")
 st.write(f"ROE履歴平均: {yen_percent(item['ROE_Avg'])}（観測 {int(item['ROE_Obs'])} 年、最大 {years} 年）")
-st.write(f"営業CF利回り: {percent(item['CFO_to_MktCap'])}（CF観測 {int(item['CFO_Obs'])} 年、最大2年）")
+st.write(f"営業CF利回り: {percent(item['CFO_to_MktCap'])}（CF観測 {int(item['CFO_Obs'])} 年、うち黒字 {int(item['CFO_Positive_Years'])} 年）")
+if item['ROE_pct'] > 30:
+    st.caption('直近ROEが30%を超えるため、参考理論PERの計算では30%を上限としています。')
+if item['CFO_Obs'] < 2 or item['CFO_Positive_Years'] < 2:
+    st.caption('営業CFが2年連続プラスと確認できないため、営業CFスコアを減点しています。')
 st.write(f"自己資本比率: {percent(item['EquityRatio'])} / ネットキャッシュ: 未判定")
 if item['ROE_Obs'] < years:
     st.caption('指定年数分のROE履歴は取得できていません。履歴の平均値を長期平均とみなさないでください。')
