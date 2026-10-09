@@ -18,7 +18,21 @@ _LOCK = threading.Lock()
 _LAST_CALL = 0.0
 
 st.set_page_config(page_title='割安株AI', page_icon='📊', layout='wide')
-st.markdown('''<style>.block-container{max-width:1100px;padding:1rem .7rem} [data-testid="stMetricValue"]{font-size:1.15rem}</style>''', unsafe_allow_html=True)
+st.markdown("""<style>
+:root{color-scheme:dark}
+.stApp,[data-testid="stAppViewContainer"]{background:#080f10;color:#e5f8f1}
+[data-testid="stSidebar"], [data-testid="stSidebarContent"]{background:#101c1c}
+.block-container{max-width:1150px;padding:1.3rem .85rem 4rem}
+h1,h2,h3{color:#b6ffe3!important;letter-spacing:.02em}
+p,li,label{color:#dceee8}
+[data-testid="stMetric"]{background:#112221;border:1px solid #24483e;border-radius:16px;padding:13px}
+[data-testid="stMetricValue"]{font-size:1.4rem;color:#b6ffe3}
+[data-testid="stMetricLabel"]{color:#b4c9c2}
+.stButton>button[kind="primary"],button[kind="primary"]{background:#85f3c5;color:#06221b;border:none;border-radius:12px;font-weight:700}
+.stButton>button[kind="primary"]:hover{background:#b6ffe3;color:#06221b}
+[data-testid="stDataFrame"], [data-testid="stExpander"]{border-radius:12px;overflow:hidden}
+a{color:#85f3c5!important}
+</style>""", unsafe_allow_html=True)
 
 
 def secret(name, default=''):
@@ -222,7 +236,7 @@ def portal_features(rows, years, cutoff):
                ROE_Trend=math.nan, CFO_Avg_Yen=math.nan, CFO_Obs=0,
                CFO_Positive_Years=0, CFO_Volatility=math.nan,
                EquityRatio=math.nan, NetCash=math.nan, NetCashConfirmed=False,
-               FinancialSource='EDINETPORTAL', FinancialYears=0)
+               FinancialSource='EDINETPORTAL', FinancialYears=0, ROE_Series=[], CFO_Series=[], CFO_Source='EDINETPORTAL')
     observations = []
     equity_by_year = {}
     net_by_year = {}
@@ -257,7 +271,7 @@ def portal_features(rows, years, cutoff):
             roe = math.nan
         if pd.notna(eq_ratio):
             eq_ratio = eq_ratio / 100 if 0 <= eq_ratio <= 100 else math.nan
-        cfo = field_value(row, 'operating_cash_flow', 'cash_flow_from_operations', 'cash_flows_from_operating_activities', 'cash_flow_operating')
+        cfo = field_value(row, 'operating_cash_flow', 'cash_flow_from_operations', 'cash_flows_from_operating_activities', 'cash_flow_operating', 'operatingCashFlow', 'cashFlowFromOperatingActivities', 'cashFlowsFromOperatingActivities', 'cashflowFromOperations', 'cashFlowOperating')
         observations.append((year, roe, eq_ratio, cfo))
     # Where ROE is absent, derive it only with consecutive-year comparable equity.
     derived = []
@@ -274,6 +288,8 @@ def portal_features(rows, years, cutoff):
     dedup = {r[0]: r for r in observations}
     recent = [dedup[y] for y in sorted(dedup)][-years:]
     out['FinancialYears'] = len(recent)
+    out['ROE_Series'] = [{'年度': r[0], 'ROE (%)': float(r[1])} for r in recent if pd.notna(r[1])]
+    out['CFO_Series'] = [{'年度': r[0], '営業CF (元データ)': float(r[3])} for r in recent if pd.notna(r[3])]
     roes = [r[1] for r in recent if pd.notna(r[1])]
     if roes:
         out['ROE_Avg'] = float(pd.Series(roes).mean())
@@ -513,7 +529,7 @@ def financial_features(frame, years):
                   ROE_Trend=math.nan, CFO_Avg_Yen=math.nan, CFO_Obs=0,
                   CFO_Positive_Years=0, CFO_Volatility=math.nan,
                   EquityRatio=math.nan, NetCash=math.nan, NetCashConfirmed=False,
-                  FinancialSource='J-Quants', FinancialYears=0)
+                  FinancialSource='J-Quants', FinancialYears=0, ROE_Series=[], CFO_Series=[], CFO_Source='J-Quants')
     annual = annual_rows(frame, years)
     if annual.empty:
         return result
@@ -532,6 +548,7 @@ def financial_features(frame, years):
                 value = float(p / average_equity * 100)
                 if math.isfinite(value):
                     roe_values.append(value)
+    result['ROE_Series'] = [{'年度': int(annual.iloc[i]['_year_end'].year), 'ROE (%)': float(profit.iloc[i] / ((equity.iloc[i-1] + equity.iloc[i])/2) * 100)} for i in range(1, len(annual)) if pd.notna(profit.iloc[i]) and pd.notna(equity.iloc[i-1]) and pd.notna(equity.iloc[i]) and (equity.iloc[i-1] + equity.iloc[i]) > 0][-years:]
     if roe_values:
         values = pd.Series(roe_values[-years:])
         result['ROE_Avg'] = float(values.mean())
@@ -540,6 +557,7 @@ def financial_features(frame, years):
         if len(values) >= 2:
             result['ROE_Trend'] = float(values.iloc[-1] - values.iloc[0])
     valid_cfo = cfo.dropna().tail(2)
+    result['CFO_Series'] = [{'年度': int(annual.iloc[i]['_year_end'].year), '営業CF (元データ)': float(cfo.iloc[i])} for i in range(len(annual)) if pd.notna(cfo.iloc[i])][-years:]
     if len(valid_cfo):
         result['CFO_Avg_Yen'] = float(valid_cfo.mean())
         result['CFO_Obs'] = len(valid_cfo)
@@ -562,10 +580,16 @@ def merge_history(jq, portal):
         merged = dict(portal)
         # CFO yields must use J-Quants yen values and J-Quants market cap.
         merged['CFO_Avg_Yen'] = jq['CFO_Avg_Yen']
-        if jq['CFO_Obs'] >= 2:
+        # Prefer the longer, consistent portal CFO history for trend and sign checks.
+        # Retain J-Quants yen-denominated CFO for the market-cap yield.
+        if portal['CFO_Obs'] >= jq['CFO_Obs'] and portal['CFO_Obs'] > 0:
+            merged['CFO_Source'] = portal.get('FinancialSource', 'EDINETPORTAL')
+        else:
             merged['CFO_Obs'] = jq['CFO_Obs']
             merged['CFO_Positive_Years'] = jq['CFO_Positive_Years']
             merged['CFO_Volatility'] = jq['CFO_Volatility']
+            merged['CFO_Series'] = jq.get('CFO_Series', [])
+            merged['CFO_Source'] = 'J-Quants'
         return merged
     return jq
 
@@ -579,11 +603,20 @@ def excluded(frame):
 
 def score_row(row, features, ratio_limit):
     per, roe = row['PER'], row['ROE_pct']
-    # A one-off extremely high ROE must not imply an unlimited fair PER.
-    # 30% is a conservative screening cap, not a forecast of fair valuation.
-    roe_for_valuation = min(30.0, max(0.0, roe))
-    fair = roe_for_valuation * 2
-    ratio = per / fair if fair > 0 else math.inf
+    # Historical-profitability-adjusted reference PER, not a theoretical fair value.
+    # Benchmark 12x is a transparent screening assumption, not an observed market multiple.
+    hist = features.get('ROE_Avg', math.nan)
+    obs = int(features.get('ROE_Obs', 0))
+    stable = features.get('ROE_Std', math.nan)
+    normalized = min(max(hist, 0), 20) if obs >= 3 and pd.notna(hist) else min(max(roe, 0), 12)
+    quality = 0.70 + 0.035 * normalized  # ROE 0% => 0.70; ROE 20% => 1.40
+    if obs < 3:
+        quality *= 0.75
+    elif pd.notna(stable):
+        quality *= max(0.70, 1 - max(0, stable - 5) / 50)
+    fair = max(5.0, min(20.0, 12.0 * quality))
+    roe_for_valuation = normalized
+    ratio = per / fair
     if not (0 < per and 0 < roe and ratio <= ratio_limit):
         return None
 
@@ -648,7 +681,8 @@ def build_results(master, valuation, years, ratio_limit, limit, use_portal, use_
     v = v.dropna(subset=['Code', 'PER', 'ROE'])
     v = v[(v['PER'] > 0) & (v['ROE'] > 0)].copy()
     v['ROE_pct'] = v['ROE'] * 100
-    v['Fair_PER'] = v['ROE_pct'].clip(upper=30) * 2
+    # Preselection is intentionally broad: the final reference PER needs historical data.
+    v['Fair_PER'] = 20.0
     v['PER_Fair_Ratio'] = v['PER'] / v['Fair_PER']
     v = v[v['Code'].isin(set(master['Code']))]
     pool = v[v['PER_Fair_Ratio'] <= ratio_limit].sort_values('PER_Fair_Ratio').head(limit)
@@ -749,13 +783,13 @@ def reason(row):
 
 
 st.title('割安株AI')
-st.caption('J-Quants V2 ＋ EDINETPORTAL ＋ EDINET DB（任意）｜参考スクリーニング')
-st.warning('財務履歴はEDINETPORTALを優先し、不足時は任意のEDINET DBを使用します。取得状況を銘柄別に表示します。公式EDINETの広範囲日付検索は初期状態で無効です。5年分の取得は保証されません。理論PERは独自の参考値であり適正株価ではありません。')
+st.caption('MINT EDITION  |  J-Quants × EDINETPORTAL  |  長期財務スクリーニング')
+st.warning('財務履歴はEDINETPORTALを優先し、不足時は任意のEDINET DBを使用します。取得状況を銘柄別に表示します。公式EDINETの広範囲日付検索は初期状態で無効です。5年分の取得は保証されません。参考PERは市場の適正株価を示すものではなく、基準12倍に長期ROEと変動性を反映した独自のスクリーニング指標です。')
 with st.sidebar:
     st.header('設定')
     st.write('J-Quants API: ' + ('設定済み' if API_KEY else '未設定'))
     years = st.slider('ROE履歴の最大年数', 3, 5, 5)
-    ratio_limit = st.slider('割安判定（実PER / 理論PER）', .20, .80, .50, .05)
+    ratio_limit = st.slider('割安判定（実PER / 参考PER）', .20, .80, .50, .05)
     limit = st.slider('財務分析する上位候補数', 5, 50, 10, 5)
     strict_net_cash = st.checkbox('ネットキャッシュ > 0 を必須', value=False)
     min_score = st.slider('最低スコア', 0, 100, 0)
@@ -801,14 +835,14 @@ if result.empty:
 
 m1, m2, m3, m4 = st.columns(4)
 m1.metric('候補数', len(result))
-m2.metric('PER/理論PER 中央値', f"{result['PER_Fair_Ratio'].median():.2f}")
+m2.metric('PER/参考PER 中央値', f"{result['PER_Fair_Ratio'].median():.2f}")
 m3.metric('ROE 中央値', f"{result['ROE_pct'].median():.1f}%")
 m4.metric('スコア中央値', f"{result['TotalScore'].median():.1f}")
 
 table = pd.DataFrame({
     'コード': result['Code'], '会社': result['CompanyName'],
     'PER': result['PER'].round(1), 'ROE': result['ROE_pct'].map(yen_percent),
-    '理論PER': result['Fair_PER'].round(1),
+    '参考PER': result['Fair_PER'].round(1),
     '割安比率': result['PER_Fair_Ratio'].map(percent),
     '営業CF利回り': result['CFO_to_MktCap'].map(percent),
     '自己資本比率': result['EquityRatio'].map(percent),
@@ -828,7 +862,7 @@ item = result.loc[result['Code'] == selected].iloc[0]
 c1, c2, c3, c4 = st.columns(4)
 c1.metric('PER', f"{item['PER']:.1f}倍")
 c2.metric('ROE', f"{item['ROE_pct']:.1f}%")
-c3.metric('理論PER', f"{item['Fair_PER']:.1f}倍")
+c3.metric('参考PER', f"{item['Fair_PER']:.1f}倍")
 c4.metric('割安比率', percent(item['PER_Fair_Ratio']))
 st.write(f"**{item['CompanyName']}**：{reason(item)}")
 st.write(f"ROE履歴平均: {yen_percent(item['ROE_Avg'])}（観測 {int(item['ROE_Obs'])} 年、最大 {years} 年／出典: {item['FinancialSource']}）")
@@ -837,9 +871,8 @@ st.caption('EDINET DB: ' + str(item.get('DB_Status', '未実行')))
 st.caption('EDINET公式: ' + str(item.get('EDINET_Status', '未実行')))
 if str(item.get('EDINET_Status', '')).startswith('APIエラー'):
     st.warning('EDINET APIでエラーが発生しています。SecretsのEDINET_API_KEYと通信状況を確認してください。')
-st.write(f"営業CF利回り: {percent(item['CFO_to_MktCap'])}（CF観測 {int(item['CFO_Obs'])} 年、うち黒字 {int(item['CFO_Positive_Years'])} 年）")
-if item['ROE_pct'] > 30:
-    st.caption('直近ROEが30%を超えるため、参考理論PERの計算では30%を上限としています。')
+st.write(f"営業CF利回り: {percent(item['CFO_to_MktCap'])}（CF観測 {int(item['CFO_Obs'])} 年、うち黒字 {int(item['CFO_Positive_Years'])} 年／履歴: {item.get('CFO_Source','不明')}）")
+st.caption('参考PERは基準12倍を長期ROE・変動性・観測年数で調整した独自指標です。適正PERや目標株価ではありません。')
 if item['CFO_Obs'] < 2 or item['CFO_Positive_Years'] < 2:
     st.caption('営業CFが2年連続プラスと確認できないため、営業CFスコアを減点しています。')
 st.write(f"自己資本比率: {percent(item['EquityRatio'])} / ネットキャッシュ: 未判定")
@@ -847,6 +880,26 @@ if item['ROE_Obs'] < years:
     st.caption('指定年数分のROE履歴は取得できていません。履歴の平均値を長期平均とみなさないでください。')
 
 # Read-only diagnosis: only fetches the selected ticker, on explicit request.
+st.subheader('過去の財務推移')
+roe_series = item.get('ROE_Series', [])
+if isinstance(roe_series, list) and roe_series:
+    roe_df = pd.DataFrame(roe_series).drop_duplicates('年度', keep='last').sort_values('年度').tail(years)
+    st.caption('ROE推移（%）｜年度別実績')
+    st.line_chart(roe_df.set_index('年度')['ROE (%)'], color='#85F3C5')
+    st.dataframe(roe_df, hide_index=True, use_container_width=True)
+else:
+    st.info('ROEの年度別推移を表示できません。')
+cfo_series = item.get('CFO_Series', [])
+if isinstance(cfo_series, list) and cfo_series:
+    cfo_df = pd.DataFrame(cfo_series).drop_duplicates('年度', keep='last').sort_values('年度').tail(years)
+    st.caption(f"営業CF推移｜{item.get('CFO_Source','不明')}。単位の異なるデータを混在させていません。")
+    st.bar_chart(cfo_df.set_index('年度')['営業CF (元データ)'], color='#85F3C5')
+    st.dataframe(cfo_df, hide_index=True, use_container_width=True)
+    if item.get('CFO_Source') != 'J-Quants':
+        st.caption('EDINETPORTALの営業CF金額は単位未検証のため、グラフは元データ値です。利回りの計算には使用していません。')
+else:
+    st.info('営業CFの年度別推移は未取得です。')
+
 st.subheader('財務データ診断（EDINETPORTAL）')
 with st.expander('取得した年度・項目名・数値を確認する', expanded=False):
     st.caption('選択中の銘柄だけを再取得し、返されたJSONの構造とROE計算に必要な項目を確認します。APIキーは表示しません。')
@@ -864,7 +917,7 @@ with st.expander('取得した年度・項目名・数値を確認する', expan
                     'ROE候補': ('roe', 'return_on_equity', 'roe_percent', 'roe_pct', 'returnOnEquity'),
                     '純利益候補': ('net_income_attributable_to_owners_of_parent', 'net_income', 'profit_attributable_to_owners_of_parent', 'netIncome'),
                     '自己資本候補': ('shareholders_equity', 'equity_attributable_to_owners_of_parent', 'equity', 'shareholdersEquity'),
-                    '営業CF候補': ('operating_cash_flow', 'cash_flow_from_operations', 'cash_flows_from_operating_activities', 'cash_flow_operating', 'operatingCashFlow'),
+                    '営業CF候補': ('operating_cash_flow', 'cash_flow_from_operations', 'cash_flows_from_operating_activities', 'cash_flow_operating', 'operatingCashFlow', 'cashFlowFromOperatingActivities', 'cashFlowsFromOperatingActivities'),
                 }
                 all_keys = sorted({str(k) for r in diagnostic_rows for k in r.keys()})
                 st.write('**APIから返された項目名（全行の和集合）**')
