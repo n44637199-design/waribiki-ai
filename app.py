@@ -42,7 +42,30 @@ a{color:#85f3c5!important}
 .roe-value.negative{color:#f0a5a5}
 @media(max-width:640px){.block-container{padding:1rem .8rem 4rem}h1{font-size:2rem!important}h2{font-size:1.45rem!important}[data-testid="stMetricValue"]{font-size:1.2rem!important}.roe-row{gap:9px;padding:11px 10px}.roe-value{font-size:1.1rem;min-width:69px}}
 
+.cf-value{font-size:clamp(11px,2.6vw,15px);font-weight:700;color:#b6ffe3;white-space:nowrap;text-align:right;min-width:125px;font-variant-numeric:tabular-nums}.cf-value.negative{color:#f0a5a5}@media(max-width:480px){.cf-value{min-width:118px;font-size:11px}}
 </style>""", unsafe_allow_html=True)
+
+
+def japanese_large_number(value):
+    """円単位の金額を日本語の位取りで表示する。"""
+    try:
+        number = float(value)
+        if not math.isfinite(number):
+            return '—'
+    except (TypeError, ValueError):
+        return '—'
+    sign = '−' if number < 0 else ''
+    integer = int(round(abs(number)))
+    if integer == 0:
+        return '0円'
+    parts = []
+    for unit_value, unit_label in ((10**12, '兆'), (10**8, '億'), (10**4, '万'), (10**3, '千')):
+        amount, integer = divmod(integer, unit_value)
+        if amount:
+            parts.append(f'{amount:,}{unit_label}')
+    if integer:
+        parts.append(f'{integer:,}')
+    return sign + ''.join(parts) + '円'
 
 
 def secret(name, default=''):
@@ -908,11 +931,31 @@ else:
 cfo_series = item.get('CFO_Series', [])
 if isinstance(cfo_series, list) and cfo_series:
     cfo_df = pd.DataFrame(cfo_series).drop_duplicates('年度', keep='last').sort_values('年度').tail(years)
-    st.caption('営業CF推移｜年度別実績。単位の異なるデータを混在させていません。')
-    st.bar_chart(cfo_df.set_index('年度')['営業CF (元データ)'], color='#85F3C5')
-    st.dataframe(cfo_df, hide_index=True, use_container_width=True)
+    st.markdown('#### 営業CFの5年推移')
+    st.caption('営業キャッシュフローを円単位で、億・万・千の位取りで表示します。')
+    # The amount is treated as yen; validate provider units against filings before general release.
+    cf_numeric = pd.to_numeric(cfo_df['営業CF (元データ)'], errors='coerce')
+    cf_max = max(1.0, float(cf_numeric.abs().max())) if cf_numeric.notna().any() else 1.0
+    for _, cf_rec in cfo_df.iterrows():
+        cf_val = pd.to_numeric(cf_rec['営業CF (元データ)'], errors='coerce')
+        if pd.isna(cf_val):
+            continue
+        cf_year = html.escape(str(int(cf_rec['年度'])))
+        cf_negative = ' negative' if float(cf_val) < 0 else ''
+        cf_width = max(2.0, min(100.0, abs(float(cf_val)) / cf_max * 100.0))
+        cf_formatted = japanese_large_number(cf_val)
+        st.markdown(
+            f'<div class="roe-row"><span class="roe-year">{cf_year}年</span>'
+            f'<div class="roe-track"><div class="roe-fill{cf_negative}" style="width:{cf_width:.1f}%"></div></div>'
+            f'<span class="cf-value{cf_negative}">{cf_formatted}</span></div>',
+            unsafe_allow_html=True,
+        )
+    with st.expander('営業CFの数値表を見る', expanded=False):
+        cf_display = cfo_df.copy()
+        cf_display['営業CF（円）'] = cf_display['営業CF (元データ)'].map(japanese_large_number)
+        st.dataframe(cf_display[['年度', '営業CF（円）']], hide_index=True, use_container_width=True)
     if item.get('CFO_Source') != 'J-Quants':
-        st.caption('EDINETPORTALの営業CF金額は単位未検証のため、グラフは元データ値です。利回りの計算には使用していません。')
+        st.caption('営業CFは円単位として表示しています。銘柄ごとのAPI値と決算原本の照合は未完了です。EDINETPORTAL由来の営業CFは利回り計算に使用していません。')
 else:
     st.info('営業CFの年度別推移は未取得です。')
 
