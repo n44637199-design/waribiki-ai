@@ -5,6 +5,7 @@ import threading
 import io
 import zipfile
 import re
+import html
 import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -32,6 +33,15 @@ p,li,label{color:#dceee8}
 .stButton>button[kind="primary"]:hover{background:#b6ffe3;color:#06221b}
 [data-testid="stDataFrame"], [data-testid="stExpander"]{border-radius:12px;overflow:hidden}
 a{color:#85f3c5!important}
+.roe-row{display:flex;align-items:center;gap:12px;background:#112221;border:1px solid #24483e;border-radius:12px;padding:12px 14px;margin:8px 0}
+.roe-year{min-width:56px;color:#b5ccc3;font-size:.94rem;font-weight:600}
+.roe-track{height:9px;flex:1;background:#29403a;border-radius:9px;overflow:hidden}
+.roe-fill{height:100%;border-radius:9px;background:#85f3c5}
+.roe-fill.negative{background:#f0a5a5}
+.roe-value{min-width:76px;text-align:right;color:#b6ffe3;font-size:1.2rem;font-weight:750;font-variant-numeric:tabular-nums}
+.roe-value.negative{color:#f0a5a5}
+@media(max-width:640px){.block-container{padding:1rem .8rem 4rem}h1{font-size:2rem!important}h2{font-size:1.45rem!important}[data-testid="stMetricValue"]{font-size:1.2rem!important}.roe-row{gap:9px;padding:11px 10px}.roe-value{font-size:1.1rem;min-width:69px}}
+
 </style>""", unsafe_allow_html=True)
 
 
@@ -783,21 +793,21 @@ def reason(row):
 
 
 st.title('割安株AI')
-st.caption('MINT EDITION  |  J-Quants × EDINETPORTAL  |  長期財務スクリーニング')
-st.warning('財務履歴はEDINETPORTALを優先し、不足時は任意のEDINET DBを使用します。取得状況を銘柄別に表示します。公式EDINETの広範囲日付検索は初期状態で無効です。5年分の取得は保証されません。参考PERは市場の適正株価を示すものではなく、基準12倍に長期ROEと変動性を反映した独自のスクリーニング指標です。')
+st.caption('MINT EDITION  |  日本株の割安度と長期財務をチェック')
+st.caption('5年分の収益性とキャッシュフローを確認。参考PERは独自の比較指標であり、目標株価ではありません。')
 with st.sidebar:
     st.header('設定')
-    st.write('J-Quants API: ' + ('設定済み' if API_KEY else '未設定'))
+    st.caption('条件を変更して候補を絞り込めます。')
     years = st.slider('ROE履歴の最大年数', 3, 5, 5)
     ratio_limit = st.slider('割安判定（実PER / 参考PER）', .20, .80, .50, .05)
     limit = st.slider('財務分析する上位候補数', 5, 50, 10, 5)
     strict_net_cash = st.checkbox('ネットキャッシュ > 0 を必須', value=False)
     min_score = st.slider('最低スコア', 0, 100, 0)
-    st.write('EDINET API: ' + ('設定済み' if EDINET_KEY else '未設定'))
-    use_edinet = st.checkbox('EDINET公式CSVで過去年度を補完（低速・詳細検証用）', value=False)
-    use_portal = st.checkbox('EDINETPORTALの長期財務履歴を取得（APIキー不要）', value=True)
-    st.write('EDINET DB API: ' + ('設定済み' if EDINETDB_KEY else '未設定（任意）'))
-    use_db = st.checkbox('EDINET DBで不足履歴を補完（任意・利用回数制限あり）', value=bool(EDINETDB_KEY), disabled=not bool(EDINETDB_KEY))
+    with st.expander('詳細設定（データ取得）', expanded=False):
+        st.caption('通常は変更不要です。')
+        use_edinet = st.checkbox('EDINET公式CSVで補完（低速）', value=False)
+        use_portal = st.checkbox('長期財務データを取得', value=True)
+        use_db = st.checkbox('追加データで不足履歴を補完', value=bool(EDINETDB_KEY), disabled=not bool(EDINETDB_KEY))
     run = st.button('スクリーニング実行', type='primary', use_container_width=True)
 
 if not API_KEY:
@@ -846,10 +856,7 @@ table = pd.DataFrame({
     '割安比率': result['PER_Fair_Ratio'].map(percent),
     '営業CF利回り': result['CFO_to_MktCap'].map(percent),
     '自己資本比率': result['EquityRatio'].map(percent),
-    'ROE観測年数': result['ROE_Obs'], '5年ROE充足': result['ROE_Obs'].map(lambda n: '取得済' if n >= years else f'不足（{n}/{years}）'), '財務履歴出典': result['FinancialSource'],
-    'EDINETPORTAL': result.get('Portal_Status', pd.Series('未実行', index=result.index)),
-    'EDINET DB': result.get('DB_Status', pd.Series('未実行', index=result.index)),
-    'EDINET公式': result.get('EDINET_Status', pd.Series('未実行', index=result.index)),
+    'ROE観測年数': result['ROE_Obs'], '5年ROE充足': result['ROE_Obs'].map(lambda n: '取得済' if n >= years else f'不足（{n}/{years}）'),
     'ネットキャッシュ': '未判定', '総合スコア': result['TotalScore'].round(1),
 })
 st.dataframe(table, use_container_width=True, hide_index=True)
@@ -865,13 +872,8 @@ c2.metric('ROE', f"{item['ROE_pct']:.1f}%")
 c3.metric('参考PER', f"{item['Fair_PER']:.1f}倍")
 c4.metric('割安比率', percent(item['PER_Fair_Ratio']))
 st.write(f"**{item['CompanyName']}**：{reason(item)}")
-st.write(f"ROE履歴平均: {yen_percent(item['ROE_Avg'])}（観測 {int(item['ROE_Obs'])} 年、最大 {years} 年／出典: {item['FinancialSource']}）")
-st.caption('EDINETPORTAL: ' + str(item.get('Portal_Status', '未実行')))
-st.caption('EDINET DB: ' + str(item.get('DB_Status', '未実行')))
-st.caption('EDINET公式: ' + str(item.get('EDINET_Status', '未実行')))
-if str(item.get('EDINET_Status', '')).startswith('APIエラー'):
-    st.warning('EDINET APIでエラーが発生しています。SecretsのEDINET_API_KEYと通信状況を確認してください。')
-st.write(f"営業CF利回り: {percent(item['CFO_to_MktCap'])}（CF観測 {int(item['CFO_Obs'])} 年、うち黒字 {int(item['CFO_Positive_Years'])} 年／履歴: {item.get('CFO_Source','不明')}）")
+st.write(f"**過去ROE平均: {yen_percent(item['ROE_Avg'])}**（{int(item['ROE_Obs'])}/{years}年分）")
+st.write(f"営業CF利回り: {percent(item['CFO_to_MktCap'])}（CF観測 {int(item['CFO_Obs'])} 年、うち黒字 {int(item['CFO_Positive_Years'])} 年）")
 st.caption('参考PERは基準12倍を長期ROE・変動性・観測年数で調整した独自指標です。適正PERや目標株価ではありません。')
 if item['CFO_Obs'] < 2 or item['CFO_Positive_Years'] < 2:
     st.caption('営業CFが2年連続プラスと確認できないため、営業CFスコアを減点しています。')
@@ -884,15 +886,29 @@ st.subheader('過去の財務推移')
 roe_series = item.get('ROE_Series', [])
 if isinstance(roe_series, list) and roe_series:
     roe_df = pd.DataFrame(roe_series).drop_duplicates('年度', keep='last').sort_values('年度').tail(years)
-    st.caption('ROE推移（%）｜年度別実績')
-    st.line_chart(roe_df.set_index('年度')['ROE (%)'], color='#85F3C5')
-    st.dataframe(roe_df, hide_index=True, use_container_width=True)
+    st.markdown('**ROEの5年推移**')
+    st.caption('年ごとの数値を大きく表示しています。赤色はマイナスROEです。')
+    valid_roe = pd.to_numeric(roe_df['ROE (%)'], errors='coerce').dropna()
+    max_abs_roe = max(10.0, float(valid_roe.abs().max())) if not valid_roe.empty else 10.0
+    for _, rec in roe_df.iterrows():
+        v = pd.to_numeric(rec['ROE (%)'], errors='coerce')
+        if pd.isna(v):
+            continue
+        yr = html.escape(str(int(rec['年度'])))
+        neg = ' negative' if float(v) < 0 else ''
+        width = max(2.0, min(100.0, abs(float(v)) / max_abs_roe * 100.0))
+        st.markdown(f'<div class="roe-row"><span class="roe-year">{yr}年</span>'
+                    f'<div class="roe-track"><div class="roe-fill{neg}" style="width:{width:.1f}%"></div></div>'
+                    f'<span class="roe-value{neg}">{float(v):+.1f}%</span></div>', unsafe_allow_html=True)
+    with st.expander('折れ線グラフと数値表を見る', expanded=False):
+        st.line_chart(roe_df.set_index('年度')['ROE (%)'], color='#85F3C5', height=240)
+        st.dataframe(roe_df, hide_index=True, use_container_width=True)
 else:
     st.info('ROEの年度別推移を表示できません。')
 cfo_series = item.get('CFO_Series', [])
 if isinstance(cfo_series, list) and cfo_series:
     cfo_df = pd.DataFrame(cfo_series).drop_duplicates('年度', keep='last').sort_values('年度').tail(years)
-    st.caption(f"営業CF推移｜{item.get('CFO_Source','不明')}。単位の異なるデータを混在させていません。")
+    st.caption('営業CF推移｜年度別実績。単位の異なるデータを混在させていません。')
     st.bar_chart(cfo_df.set_index('年度')['営業CF (元データ)'], color='#85F3C5')
     st.dataframe(cfo_df, hide_index=True, use_container_width=True)
     if item.get('CFO_Source') != 'J-Quants':
@@ -900,8 +916,14 @@ if isinstance(cfo_series, list) and cfo_series:
 else:
     st.info('営業CFの年度別推移は未取得です。')
 
-st.subheader('財務データ診断（EDINETPORTAL）')
-with st.expander('取得した年度・項目名・数値を確認する', expanded=False):
+with st.expander('データの出典・取得状況・詳細診断（任意）', expanded=False):
+    st.caption('データ提供元：J-Quants、EDINETPORTAL。追加設定時はEDINET DB・金融庁EDINETも使用します。各サービスの利用条件に従ってください。')
+    st.write('ROE履歴の出典:', item.get('FinancialSource', '不明'))
+    st.write('営業CF履歴の出典:', item.get('CFO_Source', '不明'))
+    st.caption('EDINETPORTAL: ' + str(item.get('Portal_Status', '未実行')))
+    st.caption('EDINET DB: ' + str(item.get('DB_Status', '未実行')))
+    st.caption('EDINET公式: ' + str(item.get('EDINET_Status', '未実行')))
+    st.markdown('**取得した年度・項目名・数値を確認する**')
     st.caption('選択中の銘柄だけを再取得し、返されたJSONの構造とROE計算に必要な項目を確認します。APIキーは表示しません。')
     if st.button('この銘柄の財務データを診断', key=f'portal_diagnose_{selected}'):
         try:
