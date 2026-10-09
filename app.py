@@ -798,7 +798,7 @@ def yen_percent(value):
 def reason(row):
     notes = []
     if row['PER_Fair_Ratio'] <= .5:
-        notes.append('理論PERに対して割安')
+        notes.append('独自の参考PERを下回る')
     if row['ROE_Obs'] >= 2 and pd.notna(row['ROE_Avg']):
         notes.append('ROE履歴を確認済み' if row['ROE_pct'] >= row['ROE_Avg'] * .9 else '過去平均よりROE低下')
     if row['CFO_Obs'] >= 2 and row['CFO_Positive_Years'] == 2 and pd.notna(row['CFO_to_MktCap']) and row['CFO_to_MktCap'] >= .05:
@@ -813,6 +813,48 @@ def reason(row):
         notes.append('営業CFの継続性未確認')
     notes.append('ネットキャッシュ未判定')
     return ' / '.join(notes)
+
+
+def quality_assessment(item, years):
+    """既存の100点スコアを4要素に分解。未取得項目は満点扱いしない。"""
+    sections = [
+        ('割安度', 'UndervaluationScore', 40),
+        ('収益性・安定性', 'ROESustainabilityScore', 25),
+        ('キャッシュ創出力', 'CFOYieldScore', 20),
+        ('財務健全性', 'EquityRatioScore', 15),
+    ]
+    strengths, cautions = [], []
+    if item['PER_Fair_Ratio'] <= 0.4:
+        strengths.append('実PERが独自の参考PERより低い水準です')
+    if item['ROE_Obs'] >= 3 and pd.notna(item['ROE_Avg']) and item['ROE_Avg'] >= 8:
+        strengths.append('複数年のROE平均が8%以上です')
+    if item['CFO_Obs'] >= 3 and item['CFO_Positive_Years'] >= 3:
+        strengths.append('営業CFの黒字を複数年確認できています')
+    if pd.notna(item['EquityRatio']) and item['EquityRatio'] >= 0.5:
+        strengths.append('自己資本比率が50%以上です')
+    if item['ROE_Obs'] < years:
+        cautions.append(f"ROE履歴は{int(item['ROE_Obs'])}/{years}年分です")
+    if item['CFO_Obs'] < years:
+        cautions.append(f"営業CF履歴は{int(item['CFO_Obs'])}/{years}年分です")
+    if item['CFO_Positive_Years'] < min(3, int(item['CFO_Obs'])):
+        cautions.append('営業CFがマイナスの年度があります')
+    if pd.isna(item['EquityRatio']):
+        cautions.append('自己資本比率を取得できていません')
+    if not strengths:
+        strengths.append('取得済み指標から総合スコアを算出しています')
+    if not cautions:
+        cautions.append('株価や業績は変動するため、直近の決算も確認してください')
+    return sections, strengths[:3], cautions[:3]
+
+
+def date_freshness_message(valuation_day):
+    try:
+        age = (date.today() - date.fromisoformat(valuation_day)).days
+    except (ValueError, TypeError):
+        return '株価指標の基準日を確認できません'
+    if age > 30:
+        return f'株価指標は{age}日前のデータです。現在のPERや株価とは異なる可能性があります。'
+    return f'株価指標は{age}日前のデータです。'
 
 
 st.title('割安株AI')
@@ -859,7 +901,9 @@ if run or 'result' not in st.session_state or st.session_state.get('settings') !
         st.stop()
 
 result = st.session_state['result']
-st.caption(f"実行日時: {st.session_state['updated']} / 株価指標基準日: {st.session_state['valuation_day']} / 財務分析: {st.session_state['analyzed']}社 / 候補: {len(result)}社")
+valuation_day_display = st.session_state['valuation_day']
+st.info(f'**PER・時価総額などの株価指標の基準日：{valuation_day_display}**\n\n{date_freshness_message(valuation_day_display)}')
+st.caption(f"分析実行：{st.session_state['updated']} / 財務分析：{st.session_state['analyzed']}社 / 候補：{len(result)}社")
 if st.session_state.get('failures'):
     st.warning(f"財務データ取得に失敗した銘柄: {st.session_state['failures']}社")
 if result.empty:
@@ -874,7 +918,7 @@ m4.metric('スコア中央値', f"{result['TotalScore'].median():.1f}")
 
 table = pd.DataFrame({
     'コード': result['Code'], '会社': result['CompanyName'],
-    'PER': result['PER'].round(1), 'ROE': result['ROE_pct'].map(yen_percent),
+    'PER（株価基準日共通）': result['PER'].round(1), 'ROE': result['ROE_pct'].map(yen_percent),
     '参考PER': result['Fair_PER'].round(1),
     '割安比率': result['PER_Fair_Ratio'].map(percent),
     '営業CF利回り': result['CFO_to_MktCap'].map(percent),
@@ -882,6 +926,7 @@ table = pd.DataFrame({
     'ROE観測年数': result['ROE_Obs'], '5年ROE充足': result['ROE_Obs'].map(lambda n: '取得済' if n >= years else f'不足（{n}/{years}）'),
     'ネットキャッシュ': '未判定', '総合スコア': result['TotalScore'].round(1),
 })
+st.caption(f'一覧のPERはすべて {valuation_day_display} 時点の株価指標です。財務指標は別の決算期に基づく場合があります。')
 st.dataframe(table, use_container_width=True, hide_index=True)
 st.download_button('候補一覧CSV', result.to_csv(index=False).encode('utf-8-sig'),
                    'waribiki_candidates.csv', 'text/csv', use_container_width=True)
@@ -890,11 +935,32 @@ st.subheader('銘柄詳細')
 selected = st.selectbox('銘柄', result['Code'].tolist(), format_func=lambda c: f"{c} {result.loc[result['Code'] == c, 'CompanyName'].iloc[0]}")
 item = result.loc[result['Code'] == selected].iloc[0]
 c1, c2, c3, c4 = st.columns(4)
-c1.metric('PER', f"{item['PER']:.1f}倍")
+c1.metric(f'PER（{valuation_day_display}）', f"{item['PER']:.1f}倍")
 c2.metric('ROE', f"{item['ROE_pct']:.1f}%")
 c3.metric('参考PER', f"{item['Fair_PER']:.1f}倍")
 c4.metric('割安比率', percent(item['PER_Fair_Ratio']))
-st.write(f"**{item['CompanyName']}**：{reason(item)}")
+st.caption(f'実PER・時価総額：{valuation_day_display} 時点の株価指標 ／ ROE・営業CF：取得済み決算データ（各年度）')
+st.subheader('この銘柄の評価')
+sections, strengths, cautions = quality_assessment(item, years)
+st.metric('総合評価（100点満点）', f"{item['TotalScore']:.0f}点")
+st.caption('独自のスクリーニング評価です。投資成果や将来の株価を予測するものではありません。')
+for title, key, maximum in sections:
+    raw = item.get(key, 0)
+    score = max(0.0, min(float(raw), maximum)) if pd.notna(raw) else 0.0
+    st.write(f'**{title}：{score:.0f} / {maximum}点**')
+    st.progress(min(1.0, score / maximum))
+st.markdown('**良い点**')
+for message in strengths:
+    st.write('・' + message)
+st.markdown('**注意点・データの不足**')
+for message in cautions:
+    st.write('・' + message)
+with st.expander('評価に使ったデータの確認', expanded=False):
+    st.write(f"ROE：{int(item['ROE_Obs'])}/{years}年分")
+    st.write(f"営業CF：{int(item['CFO_Obs'])}/{years}年分（黒字 {int(item['CFO_Positive_Years'])}年）")
+    st.write(f"株価指標基準日：{valuation_day_display}")
+    st.caption('ROE・営業CFの各年度は下の財務推移で確認できます。データソースの詳細は診断欄にまとめています。')
+
 st.write(f"**過去ROE平均: {yen_percent(item['ROE_Avg'])}**（{int(item['ROE_Obs'])}/{years}年分）")
 st.write(f"営業CF利回り: {percent(item['CFO_to_MktCap'])}（CF観測 {int(item['CFO_Obs'])} 年、うち黒字 {int(item['CFO_Positive_Years'])} 年）")
 st.caption('参考PERは基準12倍を長期ROE・変動性・観測年数で調整した独自指標です。適正PERや目標株価ではありません。')
