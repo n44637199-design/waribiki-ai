@@ -148,6 +148,7 @@ def annual_rows(frame, years):
 
 
 # EDINETPORTAL is an independent third-party service, not the FSA's official API.
+# fiscalYear is camelCase in the observed live API response (11 records with roe).
 # Only historical financial fields are used; valuation stays with J-Quants.
 EDINETPORTAL_BASE = 'https://edinetportal.kazuma-45a.workers.dev'
 
@@ -229,12 +230,12 @@ def portal_features(rows, years, cutoff):
         if not isinstance(row, dict):
             continue
         # Exclude financial statements published after the J-Quants valuation date.
-        disclosed = next((row.get(k) for k in ('submit_date', 'submitted_at', 'filing_date', 'disclosure_date', 'filed_at') if row.get(k)), None)
+        disclosed = next((row.get(k) for k in ('submit_date', 'submitted_at', 'filing_date', 'disclosure_date', 'filed_at', 'filingDate', 'disclosureDate', 'submittedAt') if row.get(k)), None)
         if disclosed:
             parsed = pd.to_datetime(disclosed, errors='coerce', utc=True)
             if pd.notna(parsed) and parsed.date() > cutoff:
                 continue
-        fiscal = next((row.get(k) for k in ('fiscal_year', 'year', 'fy', 'period_end', 'fiscal_year_end') if row.get(k) is not None), None)
+        fiscal = next((row.get(k) for k in ('fiscalYear', 'fiscal_year', 'year', 'fy', 'period_end', 'fiscal_year_end', 'fiscalYearEnd') if row.get(k) is not None), None)
         if fiscal is None:
             continue
         try:
@@ -243,13 +244,14 @@ def portal_features(rows, years, cutoff):
             continue
         if year > cutoff.year:
             continue
-        # If filing date is absent, exclude current fiscal year to avoid look-ahead.
+        # Without a verified publication date, use only fiscal years that ended
+        # before the valuation year. This avoids relying on current-year data.
         if disclosed is None and year >= cutoff.year:
             continue
         roe = field_value(row, 'roe', 'return_on_equity', 'roe_percent', 'roe_pct')
-        equity_by_year[year] = field_value(row, 'shareholders_equity', 'equity_attributable_to_owners_of_parent', 'equity')
-        net_by_year[year] = field_value(row, 'net_income_attributable_to_owners_of_parent', 'net_income', 'profit_attributable_to_owners_of_parent')
-        eq_ratio = field_value(row, 'equity_ratio', 'equity_ratio_percent', 'equity_to_asset_ratio')
+        equity_by_year[year] = field_value(row, 'shareholders_equity', 'equity_attributable_to_owners_of_parent', 'equity', 'shareholdersEquity')
+        net_by_year[year] = field_value(row, 'net_income_attributable_to_owners_of_parent', 'net_income', 'profit_attributable_to_owners_of_parent', 'netIncome')
+        eq_ratio = field_value(row, 'equity_ratio', 'equity_ratio_percent', 'equity_to_asset_ratio', 'equityRatio')
         # EDINETPORTAL documents percentage ratios as 0..100 (not 0..1).
         if pd.notna(roe) and not (-200 <= roe <= 500):
             roe = math.nan
@@ -857,12 +859,12 @@ with st.expander('取得した年度・項目名・数値を確認する', expan
                 st.warning('財務データが0行です。APIの返却形式か対象銘柄を確認してください。')
             else:
                 field_groups = {
-                    '年度候補': ('fiscal_year', 'year', 'fy', 'period_end', 'fiscal_year_end'),
-                    '開示日候補': ('submit_date', 'submitted_at', 'filing_date', 'disclosure_date', 'filed_at'),
-                    'ROE候補': ('roe', 'return_on_equity', 'roe_percent', 'roe_pct'),
-                    '純利益候補': ('net_income_attributable_to_owners_of_parent', 'net_income', 'profit_attributable_to_owners_of_parent'),
-                    '自己資本候補': ('shareholders_equity', 'equity_attributable_to_owners_of_parent', 'equity'),
-                    '営業CF候補': ('operating_cash_flow', 'cash_flow_from_operations', 'cash_flows_from_operating_activities', 'cash_flow_operating'),
+                    '年度候補': ('fiscalYear', 'fiscal_year', 'year', 'fy', 'period_end', 'fiscal_year_end', 'fiscalYearEnd'),
+                    '開示日候補': ('submit_date', 'submitted_at', 'filing_date', 'disclosure_date', 'filed_at', 'filingDate', 'disclosureDate', 'submittedAt'),
+                    'ROE候補': ('roe', 'return_on_equity', 'roe_percent', 'roe_pct', 'returnOnEquity'),
+                    '純利益候補': ('net_income_attributable_to_owners_of_parent', 'net_income', 'profit_attributable_to_owners_of_parent', 'netIncome'),
+                    '自己資本候補': ('shareholders_equity', 'equity_attributable_to_owners_of_parent', 'equity', 'shareholdersEquity'),
+                    '営業CF候補': ('operating_cash_flow', 'cash_flow_from_operations', 'cash_flows_from_operating_activities', 'cash_flow_operating', 'operatingCashFlow'),
                 }
                 all_keys = sorted({str(k) for r in diagnostic_rows for k in r.keys()})
                 st.write('**APIから返された項目名（全行の和集合）**')
@@ -884,7 +886,7 @@ with st.expander('取得した年度・項目名・数値を確認する', expan
                 st.code(json.dumps(diagnostic_rows[0], ensure_ascii=False, indent=2, default=str)[:12000], language='json')
                 st.download_button('診断用JSONを保存', json.dumps(diagnostic_rows, ensure_ascii=False, indent=2, default=str).encode('utf-8'), file_name=f'portal_diagnostic_{selected}.json', mime='application/json', key=f'portal_json_{selected}')
                 diagnosed = portal_features(diagnostic_rows, years, date.fromisoformat(st.session_state['valuation_day']))
-                st.info(f'現行ロジックの判定: 財務年度 {diagnosed["FinancialYears"]} 年 / ROE {diagnosed["ROE_Obs"]} 年。項目名が「一致なし」の場合はマッピング修正が必要です。')
+                st.info(f'修正後ロジックの判定: 財務年度 {diagnosed["FinancialYears"]} 年 / ROE {diagnosed["ROE_Obs"]} 年。項目名が「一致なし」の場合はマッピング修正が必要です。')
         except Exception as exc:
             st.error(f'診断中の取得エラー: {type(exc).__name__}: {str(exc)[:350]}')
 
