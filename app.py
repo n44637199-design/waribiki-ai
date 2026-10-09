@@ -20,29 +20,40 @@ _LAST_CALL = 0.0
 
 st.set_page_config(page_title='割安株AI', page_icon='📊', layout='wide')
 st.markdown("""<style>
-:root{color-scheme:dark}
-.stApp,[data-testid="stAppViewContainer"]{background:#080f10;color:#e5f8f1}
-[data-testid="stSidebar"], [data-testid="stSidebarContent"]{background:#101c1c}
-.block-container{max-width:1150px;padding:1.3rem .85rem 4rem}
-h1,h2,h3{color:#b6ffe3!important;letter-spacing:.02em}
-p,li,label{color:#dceee8}
-[data-testid="stMetric"]{background:#112221;border:1px solid #24483e;border-radius:16px;padding:13px}
-[data-testid="stMetricValue"]{font-size:1.4rem;color:#b6ffe3}
-[data-testid="stMetricLabel"]{color:#b4c9c2}
-.stButton>button[kind="primary"],button[kind="primary"]{background:#85f3c5;color:#06221b;border:none;border-radius:12px;font-weight:700}
-.stButton>button[kind="primary"]:hover{background:#b6ffe3;color:#06221b}
-[data-testid="stDataFrame"], [data-testid="stExpander"]{border-radius:12px;overflow:hidden}
-a{color:#85f3c5!important}
-.roe-row{display:flex;align-items:center;gap:12px;background:#112221;border:1px solid #24483e;border-radius:12px;padding:12px 14px;margin:8px 0}
-.roe-year{min-width:56px;color:#b5ccc3;font-size:.94rem;font-weight:600}
-.roe-track{height:9px;flex:1;background:#29403a;border-radius:9px;overflow:hidden}
-.roe-fill{height:100%;border-radius:9px;background:#85f3c5}
-.roe-fill.negative{background:#f0a5a5}
-.roe-value{min-width:76px;text-align:right;color:#b6ffe3;font-size:1.2rem;font-weight:750;font-variant-numeric:tabular-nums}
-.roe-value.negative{color:#f0a5a5}
-@media(max-width:640px){.block-container{padding:1rem .8rem 4rem}h1{font-size:2rem!important}h2{font-size:1.45rem!important}[data-testid="stMetricValue"]{font-size:1.2rem!important}.roe-row{gap:9px;padding:11px 10px}.roe-value{font-size:1.1rem;min-width:69px}}
-
-.cf-value{font-size:clamp(11px,2.6vw,15px);font-weight:700;color:#b6ffe3;white-space:nowrap;text-align:right;min-width:125px;font-variant-numeric:tabular-nums}.cf-value.negative{color:#f0a5a5}@media(max-width:480px){.cf-value{min-width:118px;font-size:11px}}
+/* Bright, friendly mobile-first theme. Financial calculations unchanged. */
+:root{color-scheme:light}
+.stApp,[data-testid="stAppViewContainer"]{background:linear-gradient(155deg,#fff9f2 0%,#f5fcf8 50%,#f5f7ff 100%);color:#26364b}
+[data-testid="stSidebar"],[data-testid="stSidebarContent"]{background:#f1faf6}
+.block-container{max-width:1050px;padding:1.4rem 1rem 4rem}
+h1,h2,h3{color:#26364b!important;letter-spacing:-.025em}
+h1{font-weight:850!important}h2,h3{font-weight:750!important}
+p,li,label{color:#34465b}
+[data-testid="stMetric"]{background:#fff;border:1px solid #e4eceb;border-radius:20px;padding:14px;box-shadow:0 5px 18px rgba(42,77,65,.055)}
+[data-testid="stMetricValue"]{font-size:1.55rem;color:#168b71;font-weight:800}
+[data-testid="stMetricLabel"]{color:#5b6b7b}
+.stButton>button[kind="primary"],button[kind="primary"]{background:#24c59b;color:#102d28;border:none;border-radius:16px;font-weight:800;min-height:48px;box-shadow:0 4px 0 #159575}
+.stButton>button[kind="primary"]:hover,button[kind="primary"]:hover{background:#3fdbb0;color:#102d28}
+.stButton>button:not([kind="primary"]),[data-testid="stDownloadButton"] button{border-radius:14px;border:1px solid #b9e7d8;background:#fff;color:#167c67;font-weight:650}
+[data-testid="stDataFrame"],[data-testid="stExpander"]{border-radius:18px;overflow:hidden}
+[data-testid="stExpander"]{background:#fff;border:1px solid #e5eeeb}
+[data-testid="stAlert"]{border-radius:17px}
+[data-testid="stTextInput"] input,[data-testid="stNumberInput"] input{border-radius:12px}
+a{color:#0b9876!important}
+.roe-row{display:flex;align-items:center;gap:12px;background:#fff;border:1px solid #e1eee9;border-radius:15px;padding:12px 14px;margin:8px 0;box-shadow:0 3px 12px rgba(33,90,72,.04)}
+.roe-year{min-width:56px;color:#5e6f7d;font-size:.94rem;font-weight:650}
+.roe-track{height:11px;flex:1;background:#e4f3ed;border-radius:10px;overflow:hidden}
+.roe-fill{height:100%;border-radius:10px;background:#27c69e}
+.roe-fill.negative{background:#f17d8a}
+.roe-value{min-width:76px;text-align:right;color:#128b70;font-size:1.2rem;font-weight:800;font-variant-numeric:tabular-nums}
+.roe-value.negative{color:#d9506b}
+.cf-value{font-size:clamp(11px,2.6vw,15px);font-weight:750;color:#128b70;white-space:nowrap;text-align:right;min-width:125px;font-variant-numeric:tabular-nums}
+.cf-value.negative{color:#d9506b}
+.welcome-card{background:linear-gradient(120deg,#ddfff1,#e6f3ff 70%,#fff0dd);border:1px solid #d7eee4;border-radius:24px;padding:20px 22px;margin:0 0 20px;box-shadow:0 8px 24px rgba(37,124,96,.06)}
+.welcome-kicker{font-size:.8rem;font-weight:800;color:#198c71;letter-spacing:.08em}
+.welcome-card h1{margin:.25rem 0 .35rem;font-size:2.1rem!important;color:#1a6155!important}
+.welcome-card p{margin:0;color:#516777;font-size:.97rem;line-height:1.6}
+.pill-note{display:inline-block;background:#e7f9f1;color:#137b61;border-radius:999px;padding:5px 11px;font-size:.8rem;font-weight:700;margin:8px 5px 0 0}
+@media(max-width:640px){.block-container{padding:.85rem .72rem 4rem}h1{font-size:1.8rem!important}h2{font-size:1.4rem!important}[data-testid="stMetricValue"]{font-size:1.22rem!important}.roe-row{gap:8px;padding:10px}.roe-value{font-size:1.05rem;min-width:67px}.cf-value{min-width:115px;font-size:11px}.welcome-card{padding:16px;border-radius:19px}.welcome-card h1{font-size:1.65rem!important}.welcome-card p{font-size:.86rem}}
 </style>""", unsafe_allow_html=True)
 
 
@@ -252,6 +263,44 @@ def load_edinetdb_financials(code):
         headers={'X-API-Key': EDINETDB_KEY, 'Accept': 'application/json'}, timeout=20)
     response.raise_for_status()
     return extract_annual_records(response.json()), edinet_code
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def load_latest_earnings(stock_code):
+    """Latest disclosed earnings for one selected company; not bulk fetched."""
+    if not EDINETDB_KEY:
+        return None, 'EDINETDB_API_KEYが未設定です'
+    try:
+        edinet_code = edinetdb_lookup(stock_code)
+        if not edinet_code:
+            return None, '証券コードと企業の対応を確認できません'
+        response = requests.get(
+            f'https://edinetdb.jp/v1/companies/{edinet_code}/earnings',
+            params={'limit': 12},
+            headers={'X-API-Key': EDINETDB_KEY, 'Accept': 'application/json'},
+            timeout=20)
+        response.raise_for_status()
+        payload = response.json()
+        data = payload.get('data', payload) if isinstance(payload, dict) else payload
+        if isinstance(data, dict):
+            rows = data.get('earnings', [])
+        elif isinstance(data, list):
+            rows = data
+        else:
+            rows = []
+        rows = [r for r in rows if isinstance(r, dict) and r.get('disclosure_date')]
+        rows.sort(key=lambda r: (str(r.get('disclosure_date', '')), bool(r.get('is_correction'))), reverse=True)
+        return (rows[0] if rows else None), ('' if rows else '決算短信のデータがありません')
+    except (requests.RequestException, ValueError, TypeError) as exc:
+        return None, f'決算速報の取得に失敗しました（{type(exc).__name__}）'
+
+
+def safe_numeric(value):
+    try:
+        n = float(value)
+        return n if math.isfinite(n) else None
+    except (TypeError, ValueError):
+        return None
 
 
 def field_value(row, *names):
@@ -857,11 +906,15 @@ def date_freshness_message(valuation_day):
     return f'株価指標は{age}日前のデータです。'
 
 
-st.title('割安株AI')
-st.caption('MINT EDITION  |  日本株の割安度と長期財務をチェック')
-st.caption('5年分の収益性とキャッシュフローを確認。参考PERは独自の比較指標であり、目標株価ではありません。')
+st.markdown("""<div class="welcome-card">
+<div class="welcome-kicker">🌱 はじめての株分析を、もっと身近に</div>
+<h1>📈 割安株AI</h1>
+<p>気になる日本株を、わかりやすい点数とグラフでチェック。<br>決算情報と過去5年の財務データを、スマホでも見やすくまとめます。</p>
+<span class="pill-note">💚 100点満点の評価</span><span class="pill-note">📅 株価の基準日を表示</span><span class="pill-note">📊 5年の財務推移</span>
+</div>""", unsafe_allow_html=True)
+st.caption('※ 点数や参考PERは独自の比較指標です。投資成果や目標株価を保証するものではありません。')
 with st.sidebar:
-    st.header('設定')
+    st.header('🔎 銘柄を探す')
     st.caption('条件を変更して候補を絞り込めます。')
     years = st.slider('ROE履歴の最大年数', 3, 5, 5)
     ratio_limit = st.slider('割安判定（実PER / 参考PER）', .20, .80, .50, .05)
@@ -873,7 +926,7 @@ with st.sidebar:
         use_edinet = st.checkbox('EDINET公式CSVで補完（低速）', value=False)
         use_portal = st.checkbox('長期財務データを取得', value=True)
         use_db = st.checkbox('追加データで不足履歴を補完', value=bool(EDINETDB_KEY), disabled=not bool(EDINETDB_KEY))
-    run = st.button('スクリーニング実行', type='primary', use_container_width=True)
+    run = st.button('🔍 割安株を探す', type='primary', use_container_width=True)
 
 if not API_KEY:
     st.error('Streamlit Secrets に JQUANTS_API_KEY を設定してください。')
@@ -940,9 +993,110 @@ c2.metric('ROE', f"{item['ROE_pct']:.1f}%")
 c3.metric('参考PER', f"{item['Fair_PER']:.1f}倍")
 c4.metric('割安比率', percent(item['PER_Fair_Ratio']))
 st.caption(f'実PER・時価総額：{valuation_day_display} 時点の株価指標 ／ ROE・営業CF：取得済み決算データ（各年度）')
-st.subheader('この銘柄の評価')
+# Manual latest-price scenario: Yahoo! is linked, never scraped.
+st.subheader('最新の決算速報（自動取得）')
+latest_earnings, earnings_error = load_latest_earnings(str(selected).strip()[:4])
+latest_eps = None
+latest_eps_date = None
+if latest_earnings:
+    disclosure = str(latest_earnings.get('disclosure_date') or '不明')[:10]
+    quarter = str(latest_earnings.get('quarter') or '').upper()
+    fiscal_end = str(latest_earnings.get('fiscal_year_end') or '未取得')[:10]
+    latest_eps = safe_numeric(latest_earnings.get('eps'))
+    latest_eps_date = disclosure
+    st.success(f'決算速報：{disclosure} 開示 ／ 対象決算期：{fiscal_end} ／ 区分：{quarter or "未取得"}')
+    e1, e2 = st.columns(2)
+    e1.metric('短信のEPS（実績）', f'{latest_eps:,.2f}円' if latest_eps is not None else '未取得')
+    profit = safe_numeric(latest_earnings.get('net_income'))
+    e2.metric('短信の純利益', japanese_large_number(profit * 1_000_000) if profit is not None else '未取得')
+    st.caption('短信の利益などの金額は百万円単位のため円換算しています。EPSは円/株です。四半期EPSは通期EPSではありません。')
+    source_pdf = str(latest_earnings.get('pdf_url') or '')
+    if source_pdf.startswith('https://'):
+        st.link_button('決算短信の原本を確認 ↗', source_pdf)
+    if quarter not in ('FY', 'Q4', '4', 'FULL_YEAR'):
+        st.warning('四半期・累計決算のEPSです。この数値をそのまま年間PERの分母には使用しません。')
+    elif latest_eps is None or latest_eps <= 0:
+        st.warning('通期のEPSが未取得または0以下のため、この速報からPERを計算できません。')
+    else:
+        st.info('通期実績EPSを取得しました。株式分割・併合や株価の株数基準が一致する場合に限り、下の入力株価からPERを試算できます。')
+else:
+    st.info('最新決算速報：' + earnings_error + '。従来の財務履歴は引き続き利用できます。')
+
+st.subheader('最新株価で再評価（手入力）')
+st.caption('Yahoo!ファイナンス等で終値を確認し、下に入力してください。株価は自動取得しません。最新の通期実績EPSがある場合のみ、EPSを使った参考PERを計算します。')
+code_for_yahoo = str(selected).strip()[:4]
+st.link_button('Yahoo!ファイナンスで株価を確認 ↗',
+               f'https://finance.yahoo.co.jp/quote/{code_for_yahoo}.T',
+               use_container_width=True)
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def historical_close(code, asof):
+    # Request only the already-licensed historical period; no Yahoo scraping.
+    day = date.fromisoformat(asof)
+    for back in range(6):
+        target = (day - timedelta(days=back)).strftime('%Y%m%d')
+        try:
+            records = jq_get('/equities/bars/daily', {'code': code, 'date': target})
+        except (JQuantsError, requests.RequestException, ValueError):
+            return None
+        for record in records:
+            for key in ('AdjC', 'C', 'Close', 'AdjustmentClose', 'AdjustmentClosePrice'):
+                try:
+                    value = float(record.get(key))
+                    if math.isfinite(value) and value > 0:
+                        return value
+                except (ValueError, TypeError):
+                    pass
+    return None
+
+old_close = historical_close(code_for_yahoo, valuation_day_display)
+st.caption(f'過去のPERの株価基準日：{valuation_day_display} ／ 過去の終値：' +
+           (f'{old_close:,.1f}円（自動取得）' if old_close else '未取得（入力してください）'))
+with st.form('price_update_' + code_for_yahoo):
+    baseline = st.number_input(f'過去の終値（{valuation_day_display}、円）',
+                               min_value=0.0, value=float(old_close or 0),
+                               step=1.0, format='%.2f',
+                               help='過去のPERと同じ基準日の株価。株式分割があった場合は比較可能な株価に調整してください。')
+    recent_price = st.number_input('確認した新しい株価（円）', min_value=0.0,
+                                   value=0.0, step=1.0, format='%.2f')
+    observed_date = st.date_input('その株価の確認日', value=date.today(), max_value=date.today())
+    apply_price = st.form_submit_button('この株価でPER・評価を再計算', type='primary', use_container_width=True)
+if apply_price:
+    if baseline <= 0 or recent_price <= 0:
+        st.warning('過去の終値と新しい株価を両方入力してください。')
+    elif observed_date < date.fromisoformat(valuation_day_display):
+        st.warning('確認日は過去のPER基準日以降にしてください。')
+    else:
+        st.session_state['manual_price_' + code_for_yahoo] = (baseline, recent_price, observed_date.isoformat())
+
+manual = st.session_state.get('manual_price_' + code_for_yahoo)
+if manual:
+    base_p, new_p, new_date = manual
+    # The old PER is rescaled by price only. EPS is held constant, not refreshed.
+    use_fy_eps = bool(latest_earnings and str(latest_earnings.get('quarter') or '').upper() in ('FY', 'Q4', '4', 'FULL_YEAR') and latest_eps is not None and latest_eps > 0 and latest_eps_date and latest_eps_date <= new_date)
+    # Prefer an explicitly identified full-year actual EPS. Otherwise use the historical price-only estimate.
+    new_per = (new_p / latest_eps) if use_fy_eps else (float(item['PER']) * new_p / base_p)
+    new_ratio = new_per / float(item['Fair_PER'])
+    obs = int(item['ROE_Obs'])
+    history_factor = 1.0 if obs >= 3 else (0.75 if obs == 2 else 0.45)
+    new_discount_score = 40 * max(0, min(1, 1 - new_ratio)) * history_factor
+    new_score = (new_discount_score + float(item['ROESustainabilityScore'])
+                 + float(item['CFOYieldScore']) + float(item['EquityRatioScore']))
+    st.success(f'入力株価：{new_p:,.2f}円（{new_date}）')
+    p1, p2 = st.columns(2)
+    p1.metric('最新通期実績EPSによる参考PER' if use_fy_eps else '株価だけ更新した参考PER', f'{new_per:.2f}倍',
+              delta=f'{new_per-float(item["PER"]):+.2f}倍（過去比）')
+    p2.metric('参考・再計算スコア', f'{new_score:.0f}/100点')
+    st.write(f'参考PERに対する比率：**{new_ratio:.1%}**')
+    if new_ratio > ratio_limit:
+        st.warning('新しい株価では、当初の割安判定条件を満たしません。')
+    st.warning(('通期実績EPSは決算速報から取得しましたが、株式分割・併合と株価の株数基準は自動照合していません。営業CF利回り・時価総額・その他財務項目は更新していないため総合評価は参考値です。' if use_fy_eps else '最新の通期EPSを利用できなかったため、過去PERを株価比で換算した参考値です。決算・株式分割・時価総額・営業CF利回りは更新していません。'))
+else:
+    st.info('以下の総合評価は、過去の株価基準日による評価です。最新株価での試算は上の入力欄から行えます。')
+
+st.subheader('🌟 この銘柄の評価')
 sections, strengths, cautions = quality_assessment(item, years)
-st.metric('総合評価（100点満点）', f"{item['TotalScore']:.0f}点")
+st.metric(f'過去基準日の総合評価（{valuation_day_display}・100点満点）', f"{item['TotalScore']:.0f}点")
 st.caption('独自のスクリーニング評価です。投資成果や将来の株価を予測するものではありません。')
 for title, key, maximum in sections:
     raw = item.get(key, 0)
@@ -971,7 +1125,7 @@ if item['ROE_Obs'] < years:
     st.caption('指定年数分のROE履歴は取得できていません。履歴の平均値を長期平均とみなさないでください。')
 
 # Read-only diagnosis: only fetches the selected ticker, on explicit request.
-st.subheader('過去の財務推移')
+st.subheader('📊 過去の財務推移')
 roe_series = item.get('ROE_Series', [])
 if isinstance(roe_series, list) and roe_series:
     roe_df = pd.DataFrame(roe_series).drop_duplicates('年度', keep='last').sort_values('年度').tail(years)
