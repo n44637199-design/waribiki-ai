@@ -314,34 +314,44 @@ def load_edinetdb_financials(code):
     return extract_annual_records(response.json()), edinet_code
 
 
-@st.cache_data(ttl=21600, show_spinner=False)
+@st.cache_data(ttl=7200, show_spinner=False)
 def load_latest_earnings(stock_code):
-    """Latest disclosed earnings for one selected company; not bulk fetched."""
+    """Get latest quarterly and full-year results separately, by disclosure date."""
     if not EDINETDB_KEY:
-        return None, 'EDINETDB_API_KEYが未設定です'
+        return None, None, 'EDINETDB_API_KEYが未設定です'
     try:
         edinet_code = edinetdb_lookup(stock_code)
         if not edinet_code:
-            return None, '企業コードの照合に失敗しました（検索結果の形式または登録状況を確認してください）'
+            return None, None, '企業コードを確認できません'
         response = requests.get(
             f'https://edinetdb.jp/v1/companies/{edinet_code}/earnings',
-            params={'limit': 12},
+            params={'limit': 30},
             headers={'X-API-Key': EDINETDB_KEY, 'Accept': 'application/json'},
-            timeout=20)
+            timeout=12)
         response.raise_for_status()
         payload = response.json()
         data = payload.get('data', payload) if isinstance(payload, dict) else payload
         if isinstance(data, dict):
-            rows = data.get('earnings', [])
+            rows = data.get('earnings') or data.get('items') or data.get('results') or []
         elif isinstance(data, list):
             rows = data
         else:
             rows = []
         rows = [r for r in rows if isinstance(r, dict) and r.get('disclosure_date')]
-        rows.sort(key=lambda r: (str(r.get('disclosure_date', '')), bool(r.get('is_correction'))), reverse=True)
-        return (rows[0] if rows else None), ('' if rows else '決算短信のデータがありません')
+        def sort_key(r):
+            return (str(r.get('disclosure_date') or '')[:10],
+                    str(r.get('fiscal_year_end') or '')[:10])
+        # Corrections can be legitimate, but avoid treating a forecast-only correction
+        # as a fresh earnings release when ordinary statements are available.
+        actual = [r for r in rows if not r.get('is_correction')] or rows
+        actual.sort(key=sort_key, reverse=True)
+        full_year = [r for r in actual if str(r.get('quarter') or '').upper() in
+                     ('FY', 'Q4', '4', 'FULL_YEAR', 'ANNUAL')]
+        latest = actual[0] if actual else None
+        fy = full_year[0] if full_year else None
+        return latest, fy, ('' if latest else '決算短信のデータがありません')
     except (requests.RequestException, ValueError, TypeError) as exc:
-        return None, f'決算速報の取得に失敗しました（{type(exc).__name__}）'
+        return None, None, f'決算速報の取得に失敗しました（{type(exc).__name__}）'
 
 
 def safe_numeric(value):
@@ -821,14 +831,9 @@ def build_results(master, valuation, years, ratio_limit, limit, use_portal, use_
         return pd.DataFrame(), 0, 0
     lookup = master.drop_duplicates('Code').set_index('Code')
     rows, failures = [], 0
-    progress = st.progress(0, text='財務データ取得中')
-    with ThreadPoolExecutor(max_workers=min(3, len(pool))) as executor:
-        jobs = {executor.submit(load_financials, str(r['Code'])): r for _, r in pool.iterrows()}
-        for done, job in enumerate(as_completed(jobs), start=1):
-            item = jobs[job]
-            progress.progress(done / len(pool), text=f'財務データ {done}/{len(pool)}')
-            try:
-                jq_frame = job.result()
+    def analyze_one(item):
+        try:
+                jq_frame = load_financials(str(item['Code']))
                 features = financial_features(jq_frame, years)
                 features['EDINET_Status'] = '未実行'
                 if use_edinet and EDINET_KEY:
@@ -875,9 +880,21 @@ def build_results(master, valuation, years, ratio_limit, limit, use_portal, use_
                     code = row['Code']
                     row['CompanyName'] = lookup.at[code, 'CompanyName'] if 'CompanyName' in lookup else code
                     row['Sector'] = lookup.at[code, 'Sector'] if 'Sector' in lookup else ''
-                    rows.append(row)
-            except Exception:
+                    return row
+        except Exception:
+            return None
+
+    progress = st.progress(0, text='財務データ取得中')
+    # Network I/O overlaps across stocks; Streamlit widgets remain on main thread.
+    with ThreadPoolExecutor(max_workers=min(6, len(pool))) as executor:
+        jobs = [executor.submit(analyze_one, r) for _, r in pool.iterrows()]
+        for done, job in enumerate(as_completed(jobs), start=1):
+            progress.progress(done / len(pool), text=f'財務データ {done}/{len(pool)}')
+            row = job.result()
+            if row is None:
                 failures += 1
+            else:
+                rows.append(row)
     progress.empty()
     result = pd.DataFrame(rows)
     if not result.empty:
@@ -968,13 +985,14 @@ with st.sidebar:
     years = st.slider('ROE履歴の最大年数', 3, 5, 5)
     ratio_limit = st.slider('割安判定（実PER / 参考PER）', .20, .80, .50, .05)
     limit = st.slider('財務分析する上位候補数', 5, 50, 10, 5)
+    st.caption('高速化：候補銘柄の財務データを最大6社並列で取得します。')
     strict_net_cash = st.checkbox('ネットキャッシュ > 0 を必須', value=False)
     min_score = st.slider('最低スコア', 0, 100, 0)
     with st.expander('詳細設定（データ取得）', expanded=False):
         st.caption('通常は変更不要です。')
         use_edinet = st.checkbox('EDINET公式CSVで補完（低速）', value=False)
         use_portal = st.checkbox('長期財務データを取得', value=True)
-        use_db = st.checkbox('追加データで不足履歴を補完', value=bool(EDINETDB_KEY), disabled=not bool(EDINETDB_KEY))
+        use_db = st.checkbox('追加データで不足履歴を補完（低速）', value=False, disabled=not bool(EDINETDB_KEY))
     run = st.button('🔍 割安株を探す', type='primary', use_container_width=True)
 
 if not API_KEY:
@@ -1066,30 +1084,42 @@ c4.metric('割安比率', percent(item['PER_Fair_Ratio']))
 st.caption(f'実PER・時価総額：{valuation_day_display} 時点の株価指標 ／ ROE・営業CF：取得済み決算データ（各年度）')
 # Manual latest-price scenario: Yahoo! is linked, never scraped.
 st.subheader('最新の決算速報（自動取得）')
-latest_earnings, earnings_error = load_latest_earnings(str(selected).strip()[:4])
+latest_earnings, latest_fy, earnings_error = load_latest_earnings(str(selected).strip()[:4])
 latest_eps = None
 latest_eps_date = None
 if latest_earnings:
     disclosure = str(latest_earnings.get('disclosure_date') or '不明')[:10]
     quarter = str(latest_earnings.get('quarter') or '').upper()
     fiscal_end = str(latest_earnings.get('fiscal_year_end') or '未取得')[:10]
-    latest_eps = safe_numeric(latest_earnings.get('eps'))
-    latest_eps_date = disclosure
-    st.success(f'決算速報：{disclosure} 開示 ／ 対象決算期：{fiscal_end} ／ 区分：{quarter or "未取得"}')
+    quarter_label = {'FY':'通期', 'Q4':'通期', '4':'通期', 'Q1':'第1四半期',
+                     'Q2':'第2四半期', 'Q3':'第3四半期'}.get(quarter, quarter or '未取得')
+    st.success(f'直近の決算短信：{disclosure} 開示 ／ 決算期末：{fiscal_end} ／ {quarter_label}')
+    if disclosure[:4].isdigit() and (date.today() - date.fromisoformat(disclosure)).days > 180:
+        st.warning('この決算短信は開示から180日以上経過しています。APIの収録状況によって最新の決算が取得できていない可能性があります。')
     e1, e2 = st.columns(2)
-    e1.metric('短信のEPS（実績）', f'{latest_eps:,.2f}円' if latest_eps is not None else '未取得')
+    recent_eps = safe_numeric(latest_earnings.get('eps'))
+    e1.metric('直近短信のEPS（実績）', f'{recent_eps:,.2f}円' if recent_eps is not None else '未取得')
     profit = safe_numeric(latest_earnings.get('net_income'))
-    e2.metric('短信の純利益', japanese_large_number(profit * 1_000_000) if profit is not None else '未取得')
-    st.caption('短信の利益などの金額は百万円単位のため円換算しています。EPSは円/株です。四半期EPSは通期EPSではありません。')
+    e2.metric('直近短信の純利益', japanese_large_number(profit * 1_000_000) if profit is not None else '未取得')
+    if quarter not in ('FY', 'Q4', '4', 'FULL_YEAR', 'ANNUAL'):
+        st.caption('四半期のEPSをそのまま年間PERの計算には使用しません。')
     source_pdf = str(latest_earnings.get('pdf_url') or '')
     if source_pdf.startswith('https://'):
-        st.link_button('決算短信の原本を確認 ↗', source_pdf)
-    if quarter not in ('FY', 'Q4', '4', 'FULL_YEAR'):
-        st.warning('四半期・累計決算のEPSです。この数値をそのまま年間PERの分母には使用しません。')
-    elif latest_eps is None or latest_eps <= 0:
-        st.warning('通期のEPSが未取得または0以下のため、この速報からPERを計算できません。')
+        st.link_button('直近決算短信の原本 ↗', source_pdf)
+    if latest_fy:
+        fy_date = str(latest_fy.get('disclosure_date') or '不明')[:10]
+        fy_end = str(latest_fy.get('fiscal_year_end') or '未取得')[:10]
+        latest_eps = safe_numeric(latest_fy.get('eps'))
+        latest_eps_date = fy_date
+        st.info(f'最新の通期決算：{fy_date} 開示 ／ 決算期末：{fy_end} ／ EPS：' +
+                (f'{latest_eps:,.2f}円' if latest_eps is not None else '未取得'))
+        if latest_eps is None or latest_eps <= 0:
+            st.warning('通期実績EPSが未取得または0以下のため、通期EPSによるPERは計算できません。')
+        else:
+            st.caption('株式分割・併合の影響を確認してから、入力株価と通期EPSによるPERを参考計算します。')
     else:
-        st.info('通期実績EPSを取得しました。株式分割・併合や株価の株数基準が一致する場合に限り、下の入力株価からPERを試算できます。')
+        st.warning('取得した直近30件に通期決算が見つかりません。通期EPSによるPERは計算できません。')
+    st.caption('決算短信の金額は百万円単位から円換算、EPSは円/株です。')
 else:
     st.info('最新決算速報：' + earnings_error + '。従来の財務履歴は引き続き利用できます。')
 
@@ -1144,7 +1174,7 @@ manual = st.session_state.get('manual_price_' + code_for_yahoo)
 if manual:
     base_p, new_p, new_date = manual
     # The old PER is rescaled by price only. EPS is held constant, not refreshed.
-    use_fy_eps = bool(latest_earnings and str(latest_earnings.get('quarter') or '').upper() in ('FY', 'Q4', '4', 'FULL_YEAR') and latest_eps is not None and latest_eps > 0 and latest_eps_date and latest_eps_date <= new_date)
+    use_fy_eps = bool(latest_fy and latest_eps is not None and latest_eps > 0 and latest_eps_date and latest_eps_date <= new_date)
     # Prefer an explicitly identified full-year actual EPS. Otherwise use the historical price-only estimate.
     new_per = (new_p / latest_eps) if use_fy_eps else (float(item['PER']) * new_p / base_p)
     new_ratio = new_per / float(item['Fair_PER'])
