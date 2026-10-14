@@ -53,6 +53,18 @@ a{color:#0b9876!important}
 .welcome-card h1{margin:.25rem 0 .35rem;font-size:2.1rem!important;color:#1a6155!important}
 .welcome-card p{margin:0;color:#516777;font-size:.97rem;line-height:1.6}
 .pill-note{display:inline-block;background:#e7f9f1;color:#137b61;border-radius:999px;padding:5px 11px;font-size:.8rem;font-weight:700;margin:8px 5px 0 0}
+.candidate-card{background:#fff;border:1px solid #dcece7;border-radius:19px;padding:15px;margin:11px 0;box-shadow:0 4px 15px rgba(32,96,78,.06)}
+.candidate-head{display:flex;align-items:flex-start;justify-content:space-between;gap:8px;margin-bottom:10px}
+.candidate-name{font-size:1.04rem;font-weight:800;color:#26364b;line-height:1.45;overflow-wrap:anywhere}
+.candidate-code{font-size:.78rem;color:#6c8190;margin-bottom:3px}
+.candidate-score{background:#dcfaed;border-radius:12px;padding:7px 9px;color:#117c60;font-size:1.04rem;font-weight:850;white-space:nowrap}
+.candidate-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}
+.candidate-metric{background:#f3f8f6;border-radius:12px;padding:9px 6px;text-align:center;min-width:0}
+.candidate-metric-label{color:#627784;font-size:.73rem}
+.candidate-metric-value{color:#173e35;font-size:1.07rem;font-weight:850;white-space:nowrap}
+.candidate-foot{font-size:.73rem;color:#788b92;margin-top:9px}
+.st-key-mobile_candidates{display:none}
+@media(max-width:640px){.st-key-mobile_candidates{display:block}.st-key-desktop_candidates{display:none}}
 @media(max-width:640px){.block-container{padding:.85rem .72rem 4rem}h1{font-size:1.8rem!important}h2{font-size:1.4rem!important}[data-testid="stMetricValue"]{font-size:1.22rem!important}.roe-row{gap:8px;padding:10px}.roe-value{font-size:1.05rem;min-width:67px}.cf-value{min-width:115px;font-size:11px}.welcome-card{padding:16px;border-radius:19px}.welcome-card h1{font-size:1.65rem!important}.welcome-card p{font-size:.86rem}}
 </style>""", unsafe_allow_html=True)
 
@@ -235,20 +247,57 @@ def extract_annual_records(payload):
     return []
 
 
+def _search_company_records(payload):
+    """Search API returns nested collections; flatten only record-like dictionaries."""
+    records = []
+    def walk(node, depth=0):
+        if depth > 5:
+            return
+        if isinstance(node, list):
+            for child in node:
+                walk(child, depth + 1)
+        elif isinstance(node, dict):
+            if any(k in node for k in ('edinet_code', 'edinetCode', 'securities_code',
+                                        'sec_code', 'stock_code', 'ticker', 'security_code')):
+                records.append(node)
+            for k in ('data', 'results', 'companies', 'items', 'matches', 'records', 'search_results'):
+                if k in node:
+                    walk(node[k], depth + 1)
+    walk(payload)
+    return records
+
+
+def _normalized_security_code(value):
+    text = str(value or '').strip().upper().replace('.T', '')
+    text = re.sub(r'[^0-9A-Z]', '', text)
+    # EDINET and securities masters may use 5-digit codes ending in 0.
+    if len(text) == 5 and text.endswith('0'):
+        text = text[:4]
+    return text
+
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def edinetdb_lookup(code):
-    """EDINET DB search is optional and requires the user's own API key."""
-    url = 'https://edinetdb.jp/v1/search'
-    response = requests.get(url, params={'q': code}, headers={'X-API-Key': EDINETDB_KEY}, timeout=15)
+    """Match exact securities code from search results; do not guess company IDs."""
+    target = _normalized_security_code(code)
+    if not target:
+        return None
+    response = requests.get(
+        'https://edinetdb.jp/v1/search',
+        params={'q': target},
+        headers={'X-API-Key': EDINETDB_KEY, 'Accept': 'application/json'},
+        timeout=15)
     response.raise_for_status()
-    data = response.json()
-    entries = extract_annual_records(data)
-    for entry in entries:
-        stock = str(entry.get('securities_code') or entry.get('stock_code') or entry.get('ticker') or '').strip()
-        if stock[:4] == code[:4]:
-            value = entry.get('edinet_code') or entry.get('code')
-            if value and str(value).startswith('E'):
-                return str(value)
+    matches = _search_company_records(response.json())
+    for entry in matches:
+        sec_codes = [entry.get(k) for k in (
+            'securities_code', 'securitiesCode', 'sec_code', 'secCode',
+            'stock_code', 'stockCode', 'ticker', 'security_code', 'securityCode')]
+        if target not in [_normalized_security_code(v) for v in sec_codes if v]:
+            continue
+        edinet = entry.get('edinet_code') or entry.get('edinetCode') or entry.get('code')
+        if edinet and re.fullmatch(r'E[0-9]{5}', str(edinet).strip().upper()):
+            return str(edinet).strip().upper()
     return None
 
 
@@ -273,7 +322,7 @@ def load_latest_earnings(stock_code):
     try:
         edinet_code = edinetdb_lookup(stock_code)
         if not edinet_code:
-            return None, '証券コードと企業の対応を確認できません'
+            return None, '企業コードの照合に失敗しました（検索結果の形式または登録状況を確認してください）'
         response = requests.get(
             f'https://edinetdb.jp/v1/companies/{edinet_code}/earnings',
             params={'limit': 12},
@@ -980,7 +1029,29 @@ table = pd.DataFrame({
     'ネットキャッシュ': '未判定', '総合スコア': result['TotalScore'].round(1),
 })
 st.caption(f'一覧のPERはすべて {valuation_day_display} 時点の株価指標です。財務指標は別の決算期に基づく場合があります。')
-st.dataframe(table, use_container_width=True, hide_index=True)
+# スマートフォンでは横スクロール不要のカード表示、PCでは従来の一覧表。
+with st.container(key="mobile_candidates"):
+    for _, candidate in result.iterrows():
+        company = html.escape(str(candidate.get('CompanyName', '')))
+        code = html.escape(str(candidate.get('Code', '')))
+        def mobile_value(value, unit='', digits=1):
+            number = safe_numeric(value)
+            return f'{number:,.{digits}f}{unit}' if number is not None and math.isfinite(number) else '—'
+        per_text = mobile_value(candidate.get('PER'), '倍')
+        roe_text = mobile_value(candidate.get('ROE_pct'), '%')
+        ratio_text = percent(candidate.get('PER_Fair_Ratio'))
+        score_text = mobile_value(candidate.get('TotalScore'), '', 0)
+        st.markdown(f"""<div class="candidate-card">
+          <div class="candidate-head"><div><div class="candidate-code">{code}</div><div class="candidate-name">{company}</div></div>
+          <div class="candidate-score">{score_text}<span style="font-size:.72rem"> / 100点</span></div></div>
+          <div class="candidate-metrics">
+            <div class="candidate-metric"><div class="candidate-metric-label">PER</div><div class="candidate-metric-value">{per_text}</div></div>
+            <div class="candidate-metric"><div class="candidate-metric-label">ROE</div><div class="candidate-metric-value">{roe_text}</div></div>
+            <div class="candidate-metric"><div class="candidate-metric-label">割安比率</div><div class="candidate-metric-value">{ratio_text}</div></div>
+          </div><div class="candidate-foot">株価指標の基準日：{html.escape(str(valuation_day_display))} ／ 詳細は下の銘柄選択から</div>
+        </div>""", unsafe_allow_html=True)
+with st.container(key="desktop_candidates"):
+    st.dataframe(table, use_container_width=True, hide_index=True)
 st.download_button('候補一覧CSV', result.to_csv(index=False).encode('utf-8-sig'),
                    'waribiki_candidates.csv', 'text/csv', use_container_width=True)
 
