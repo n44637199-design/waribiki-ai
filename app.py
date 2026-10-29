@@ -8,6 +8,7 @@ import re
 import html
 import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta
+from email.utils import parsedate_to_datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
@@ -314,44 +315,81 @@ def load_edinetdb_financials(code):
     return extract_annual_records(response.json()), edinet_code
 
 
-@st.cache_data(ttl=7200, show_spinner=False)
+def parse_earnings_date(value):
+    """Accept ISO dates, RFC 2822 HTTP dates, and common Japanese date strings."""
+    if value is None:
+        return None
+    if isinstance(value, (date, datetime)):
+        return value.date() if isinstance(value, datetime) else value
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace('Z', '+00:00')).date()
+    except ValueError:
+        pass
+    try:
+        return parsedate_to_datetime(text).date()
+    except (ValueError, TypeError, IndexError):
+        pass
+    match = re.search(r'(20\d{2})[年/.-]\s*(\d{1,2})[月/.-]\s*(\d{1,2})', text)
+    if match:
+        try:
+            return date(*map(int, match.groups()))
+        except ValueError:
+            pass
+    return None
+
+
+def _earnings_rows(payload):
+    """Unwrap API responses without assuming one particular list envelope."""
+    if isinstance(payload, list):
+        return [r for r in payload if isinstance(r, dict)]
+    if not isinstance(payload, dict):
+        return []
+    for key in ('data', 'earnings', 'items', 'results', 'records'):
+        if key in payload:
+            found = _earnings_rows(payload[key])
+            if found:
+                return found
+    return []
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
 def load_latest_earnings(stock_code):
-    """Get latest quarterly and full-year results separately, by disclosure date."""
+    """Select releases by parsed disclosure date, never lexicographic HTTP date."""
     if not EDINETDB_KEY:
-        return None, None, 'EDINETDB_API_KEYが未設定です'
+        return None, None, 'EDINETDB_API_KEYが未設定です', {}
     try:
         edinet_code = edinetdb_lookup(stock_code)
         if not edinet_code:
-            return None, None, '企業コードを確認できません'
+            return None, None, '企業コードを確認できません', {}
         response = requests.get(
             f'https://edinetdb.jp/v1/companies/{edinet_code}/earnings',
             params={'limit': 30},
             headers={'X-API-Key': EDINETDB_KEY, 'Accept': 'application/json'},
             timeout=12)
         response.raise_for_status()
-        payload = response.json()
-        data = payload.get('data', payload) if isinstance(payload, dict) else payload
-        if isinstance(data, dict):
-            rows = data.get('earnings') or data.get('items') or data.get('results') or []
-        elif isinstance(data, list):
-            rows = data
-        else:
-            rows = []
-        rows = [r for r in rows if isinstance(r, dict) and r.get('disclosure_date')]
-        def sort_key(r):
-            return (str(r.get('disclosure_date') or '')[:10],
-                    str(r.get('fiscal_year_end') or '')[:10])
-        # Corrections can be legitimate, but avoid treating a forecast-only correction
-        # as a fresh earnings release when ordinary statements are available.
-        actual = [r for r in rows if not r.get('is_correction')] or rows
-        actual.sort(key=sort_key, reverse=True)
-        full_year = [r for r in actual if str(r.get('quarter') or '').upper() in
+        rows = _earnings_rows(response.json())
+        for r in rows:
+            r['_parsed_disclosure'] = parse_earnings_date(r.get('disclosure_date') or r.get('disclosureDate'))
+            r['_parsed_end'] = parse_earnings_date(r.get('fiscal_year_end') or r.get('fiscalYearEnd'))
+        valid = [r for r in rows if r['_parsed_disclosure']]
+        noncorrection = [r for r in valid if not r.get('is_correction') and not r.get('isCorrection')]
+        ordered = sorted(noncorrection or valid,
+                         key=lambda r: (r['_parsed_disclosure'], r['_parsed_end'] or date.min),
+                         reverse=True)
+        full_year = [r for r in ordered if str(r.get('quarter') or '').upper() in
                      ('FY', 'Q4', '4', 'FULL_YEAR', 'ANNUAL')]
-        latest = actual[0] if actual else None
+        latest = ordered[0] if ordered else None
         fy = full_year[0] if full_year else None
-        return latest, fy, ('' if latest else '決算短信のデータがありません')
+        info = {'edinet_code': edinet_code, 'returned': len(rows),
+                'valid_dates': len(valid), 'newest_date': str(latest['_parsed_disclosure']) if latest else None,
+                'oldest_date': str(min(r['_parsed_disclosure'] for r in valid)) if valid else None,
+                'sample_fields': list(rows[0].keys())[:20] if rows else []}
+        return latest, fy, ('' if latest else '日付を判定できる決算短信がありません'), info
     except (requests.RequestException, ValueError, TypeError) as exc:
-        return None, None, f'決算速報の取得に失敗しました（{type(exc).__name__}）'
+        return None, None, f'決算速報の取得に失敗しました（{type(exc).__name__}）', {}
 
 
 def safe_numeric(value):
@@ -1084,17 +1122,21 @@ c4.metric('割安比率', percent(item['PER_Fair_Ratio']))
 st.caption(f'実PER・時価総額：{valuation_day_display} 時点の株価指標 ／ ROE・営業CF：取得済み決算データ（各年度）')
 # Manual latest-price scenario: Yahoo! is linked, never scraped.
 st.subheader('最新の決算速報（自動取得）')
-latest_earnings, latest_fy, earnings_error = load_latest_earnings(str(selected).strip()[:4])
+if st.button('決算データを再取得する', key='refresh_earnings'):
+    load_latest_earnings.clear()
+    edinetdb_lookup.clear()
+    st.rerun()
+latest_earnings, latest_fy, earnings_error, earnings_info = load_latest_earnings(str(selected).strip()[:4])
 latest_eps = None
 latest_eps_date = None
 if latest_earnings:
-    disclosure = str(latest_earnings.get('disclosure_date') or '不明')[:10]
+    disclosure = str(latest_earnings.get('_parsed_disclosure') or '不明')
     quarter = str(latest_earnings.get('quarter') or '').upper()
-    fiscal_end = str(latest_earnings.get('fiscal_year_end') or '未取得')[:10]
+    fiscal_end = str(latest_earnings.get('_parsed_end') or '未取得')
     quarter_label = {'FY':'通期', 'Q4':'通期', '4':'通期', 'Q1':'第1四半期',
                      'Q2':'第2四半期', 'Q3':'第3四半期'}.get(quarter, quarter or '未取得')
     st.success(f'直近の決算短信：{disclosure} 開示 ／ 決算期末：{fiscal_end} ／ {quarter_label}')
-    if disclosure[:4].isdigit() and (date.today() - date.fromisoformat(disclosure)).days > 180:
+    if latest_earnings.get('_parsed_disclosure') and (date.today() - latest_earnings['_parsed_disclosure']).days > 180:
         st.warning('この決算短信は開示から180日以上経過しています。APIの収録状況によって最新の決算が取得できていない可能性があります。')
     e1, e2 = st.columns(2)
     recent_eps = safe_numeric(latest_earnings.get('eps'))
@@ -1107,8 +1149,8 @@ if latest_earnings:
     if source_pdf.startswith('https://'):
         st.link_button('直近決算短信の原本 ↗', source_pdf)
     if latest_fy:
-        fy_date = str(latest_fy.get('disclosure_date') or '不明')[:10]
-        fy_end = str(latest_fy.get('fiscal_year_end') or '未取得')[:10]
+        fy_date = str(latest_fy.get('_parsed_disclosure') or '不明')
+        fy_end = str(latest_fy.get('_parsed_end') or '未取得')
         latest_eps = safe_numeric(latest_fy.get('eps'))
         latest_eps_date = fy_date
         st.info(f'最新の通期決算：{fy_date} 開示 ／ 決算期末：{fy_end} ／ EPS：' +
@@ -1122,6 +1164,13 @@ if latest_earnings:
     st.caption('決算短信の金額は百万円単位から円換算、EPSは円/株です。')
 else:
     st.info('最新決算速報：' + earnings_error + '。従来の財務履歴は引き続き利用できます。')
+
+with st.expander('決算データの取得状況（診断用）'):
+    st.write('取得件数・日付の確認用です。APIキーは表示しません。')
+    st.json(earnings_info)
+    if latest_earnings:
+        st.write('採用した決算の元の開示日:', str(latest_earnings.get('disclosure_date')))
+        st.write('採用した決算の判定後の日付:', str(latest_earnings.get('_parsed_disclosure')))
 
 st.subheader('最新株価で再評価（手入力）')
 st.caption('Yahoo!ファイナンス等で終値を確認し、下に入力してください。株価は自動取得しません。最新の通期実績EPSがある場合のみ、EPSを使った参考PERを計算します。')
