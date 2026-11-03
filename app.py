@@ -386,7 +386,12 @@ def load_latest_earnings(stock_code):
         info = {'edinet_code': edinet_code, 'returned': len(rows),
                 'valid_dates': len(valid), 'newest_date': str(latest['_parsed_disclosure']) if latest else None,
                 'oldest_date': str(min(r['_parsed_disclosure'] for r in valid)) if valid else None,
-                'sample_fields': list(rows[0].keys())[:20] if rows else []}
+                'sample_fields': list(rows[0].keys())[:20] if rows else [],
+                'previous_fy': next(({'eps': r.get('eps'), 'net_income': r.get('net_income'),
+                                      'fiscal_end': str(r.get('_parsed_end')),
+                                      'disclosure': str(r.get('_parsed_disclosure'))}
+                                     for r in full_year if fy and r is not fy and
+                                     r.get('_parsed_end') != fy.get('_parsed_end')), None)}
         return latest, fy, ('' if latest else '日付を判定できる決算短信がありません'), info
     except (requests.RequestException, ValueError, TypeError) as exc:
         return None, None, f'決算速報の取得に失敗しました（{type(exc).__name__}）', {}
@@ -398,6 +403,38 @@ def safe_numeric(value):
         return n if math.isfinite(n) else None
     except (TypeError, ValueError):
         return None
+
+
+def annual_eps_assessment(fy, previous):
+    """Conservative full-year EPS eligibility. Never annualize quarter EPS."""
+    if not fy:
+        return {'eligible': False, 'eps': None, 'reasons': ['通期決算が取得できません。'], 'previous_eps': None}
+    eps = safe_numeric(fy.get('eps'))
+    prev_eps = safe_numeric((previous or {}).get('eps'))
+    profit = safe_numeric(fy.get('net_income'))
+    prev_profit = safe_numeric((previous or {}).get('net_income'))
+    reasons = []
+    if str(fy.get('quarter') or '').upper() not in ('FY', 'Q4', '4', 'FULL_YEAR', 'ANNUAL'):
+        reasons.append('通期決算と確認できません。')
+    if eps is None or eps <= 0:
+        reasons.append('通期実績EPSが未取得または0以下です。')
+    if fy.get('_parsed_end') is None or fy.get('_parsed_disclosure') is None:
+        reasons.append('決算期末または開示日を確認できません。')
+    if eps is not None and eps > 0 and prev_eps is not None:
+        if prev_eps <= 0:
+            reasons.append('前期が赤字のため、黒字転換による一時的な利益の可能性があります。')
+        elif eps / prev_eps >= 2.5:
+            reasons.append('EPSが前期の2.5倍以上です。一時的な利益の可能性があります。')
+    if profit is not None and prev_profit is not None and profit > 0:
+        if prev_profit <= 0:
+            reasons.append('純利益が赤字から黒字に転換しています。')
+        elif profit / prev_profit >= 2.5:
+            reasons.append('純利益が前期の2.5倍以上です。')
+    # Without a comparable prior FY, unusual gains cannot be screened out.
+    if prev_eps is None:
+        reasons.append('比較可能な前期通期EPSが未取得です。利益の継続性を判定できません。')
+    return {'eligible': not reasons, 'eps': eps, 'reasons': reasons,
+            'previous_eps': prev_eps, 'profit': profit, 'previous_profit': prev_profit}
 
 
 def field_value(row, *names):
@@ -1129,6 +1166,7 @@ if st.button('決算データを再取得する', key='refresh_earnings'):
 latest_earnings, latest_fy, earnings_error, earnings_info = load_latest_earnings(str(selected).strip()[:4])
 latest_eps = None
 latest_eps_date = None
+eps_assessment = {"eligible": False, "reasons": ["通期決算が未取得です。"], "previous_eps": None}
 if latest_earnings:
     disclosure = str(latest_earnings.get('_parsed_disclosure') or '不明')
     quarter = str(latest_earnings.get('quarter') or '').upper()
@@ -1153,8 +1191,23 @@ if latest_earnings:
         fy_end = str(latest_fy.get('_parsed_end') or '未取得')
         latest_eps = safe_numeric(latest_fy.get('eps'))
         latest_eps_date = fy_date
+        eps_assessment = annual_eps_assessment(latest_fy, earnings_info.get('previous_fy'))
         st.info(f'最新の通期決算：{fy_date} 開示 ／ 決算期末：{fy_end} ／ EPS：' +
                 (f'{latest_eps:,.2f}円' if latest_eps is not None else '未取得'))
+        st.markdown('**評価に採用する決算の確認**')
+        st.write(f'採用候補：**{fy_end}終了の通期実績**（開示日：{fy_date}）')
+        prev = earnings_info.get('previous_fy') or {}
+        prev_eps = eps_assessment.get('previous_eps')
+        if prev_eps is not None:
+            st.write(f'前期（{prev.get("fiscal_end", "不明")}）EPS：**{prev_eps:,.2f}円** → 当期EPS：**{latest_eps:,.2f}円**')
+        else:
+            st.caption('比較対象の前期通期EPSは未取得です。')
+        if eps_assessment['eligible']:
+            st.success('通期実績EPSの基本チェックを通過しました。ただし特別利益や株式分割の確認は別途必要です。')
+        else:
+            st.warning('この通期EPSは、割安度の自動更新には採用しません。')
+            for explanation in eps_assessment['reasons']:
+                st.caption('・' + explanation)
         if latest_eps is None or latest_eps <= 0:
             st.warning('通期実績EPSが未取得または0以下のため、通期EPSによるPERは計算できません。')
         else:
@@ -1223,8 +1276,8 @@ manual = st.session_state.get('manual_price_' + code_for_yahoo)
 if manual:
     base_p, new_p, new_date = manual
     # The old PER is rescaled by price only. EPS is held constant, not refreshed.
-    use_fy_eps = bool(latest_fy and latest_eps is not None and latest_eps > 0 and latest_eps_date and latest_eps_date <= new_date)
-    # Prefer an explicitly identified full-year actual EPS. Otherwise use the historical price-only estimate.
+    use_fy_eps = bool(eps_assessment.get('eligible') and latest_eps_date and latest_eps_date <= new_date)
+    # When full-year EPS is not eligible, avoid presenting a refreshed earnings-based score.
     new_per = (new_p / latest_eps) if use_fy_eps else (float(item['PER']) * new_p / base_p)
     new_ratio = new_per / float(item['Fair_PER'])
     obs = int(item['ROE_Obs'])
@@ -1240,11 +1293,12 @@ if manual:
     st.write(f'参考PERに対する比率：**{new_ratio:.1%}**')
     if new_ratio > ratio_limit:
         st.warning('新しい株価では、当初の割安判定条件を満たしません。')
-    st.warning(('通期実績EPSは決算速報から取得しましたが、株式分割・併合と株価の株数基準は自動照合していません。営業CF利回り・時価総額・その他財務項目は更新していないため総合評価は参考値です。' if use_fy_eps else '最新の通期EPSを利用できなかったため、過去PERを株価比で換算した参考値です。決算・株式分割・時価総額・営業CF利回りは更新していません。'))
+    st.warning(('通期実績EPSを採用した参考計算です。ただし特別利益・株式分割の自動検証は未実装で、営業CF利回り・時価総額・ROEは旧決算ベースのままです。100点満点は参考値であり、ランキング全体は更新されません。' if use_fy_eps else '新しい通期EPSを安全に採用できないため、過去のPERを株価比で換算した仮定の試算です。最新決算を反映したPER・総合評価ではありません。'))
 else:
     st.info('以下の総合評価は、過去の株価基準日による評価です。最新株価での試算は上の入力欄から行えます。')
 
 st.subheader('🌟 この銘柄の評価')
+st.caption('下の基本評価は過去基準日のランキング評価です。最新決算・手入力株価による試算とは別です。')
 sections, strengths, cautions = quality_assessment(item, years)
 st.metric(f'過去基準日の総合評価（{valuation_day_display}・100点満点）', f"{item['TotalScore']:.0f}点")
 st.caption('独自のスクリーニング評価です。投資成果や将来の株価を予測するものではありません。')
